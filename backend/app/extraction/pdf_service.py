@@ -31,6 +31,7 @@ class PdfExtractionResult:
 
     text: str
     page_count: int
+    pages: tuple[str, ...]
 
 
 class PdfTextExtractionService:
@@ -107,9 +108,10 @@ class PdfTextExtractionService:
         text = result.get("text")
         page_count = result.get("page_count", 0)
         if code == "ok":
-            if not isinstance(text, str) or not isinstance(page_count, int):
+            pages = result.get("page_texts")
+            if not isinstance(text, str) or not isinstance(page_count, int) or not isinstance(pages, list) or any(not isinstance(page, str) for page in pages) or len(pages) != page_count:
                 raise PdfDocumentError("invalid_pdf", "The PDF is malformed or unreadable.")
-            return PdfExtractionResult(text=text, page_count=page_count)
+            return PdfExtractionResult(text=text, page_count=page_count, pages=tuple(pages))
         if code == "encrypted_pdf":
             raise PdfDocumentError(
                 code, "Encrypted or password-protected PDFs are not supported."
@@ -127,6 +129,6 @@ class PdfTextExtractionService:
         if code == "no_extractable_text":
             raise PdfDocumentError(
                 code,
-                "No extractable text was found. Scanned PDFs and images are not supported here.",
+                "No machine-readable text was found in the PDF.",
             )
         raise PdfDocumentError("invalid_pdf", "The PDF is malformed or unreadable.")

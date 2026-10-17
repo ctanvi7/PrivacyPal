@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import ipaddress
 import math
 import os
+from urllib.parse import urlparse
 
 
 @dataclass(frozen=True)
@@ -16,6 +17,10 @@ class Settings:
     pdf_max_pages: int = 25
     pdf_max_chars: int = 25_000
     pdf_timeout_seconds: float = 15.0
+    ollama_base_url: str = "http://127.0.0.1:11434"
+    gemma_model: str = "gemma4:e4b"
+    frontend_origin: str = "http://127.0.0.1:5173"
+    model_timeout_seconds: float = 120.0
 
 
 def _positive_int(name: str, default: int) -> int:
@@ -59,6 +64,15 @@ def get_settings() -> Settings:
     if not 1 <= port <= 65535:
         raise ValueError("APP_PORT must be an integer from 1 to 65535")
 
+    ollama_base_url = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
+    ollama = urlparse(ollama_base_url)
+    if ollama.scheme != "http" or ollama.hostname not in {"127.0.0.1", "localhost", "::1"} or ollama.username or ollama.password:
+        raise ValueError("OLLAMA_BASE_URL must be a loopback HTTP URL")
+    frontend_origin = os.getenv("FRONTEND_ORIGIN", "http://127.0.0.1:5173")
+    origin = urlparse(frontend_origin)
+    if origin.scheme != "http" or origin.hostname not in {"127.0.0.1", "localhost", "::1"} or not origin.port or origin.path not in {"", "/"} or origin.username or origin.password:
+        raise ValueError("FRONTEND_ORIGIN must be a local HTTP origin with a port")
+
     return Settings(
         host=str(address),
         port=port,
@@ -66,4 +80,8 @@ def get_settings() -> Settings:
         pdf_max_pages=_positive_int("PDF_MAX_PAGES", 25),
         pdf_max_chars=_positive_int("PDF_MAX_CHARS", 25_000),
         pdf_timeout_seconds=_positive_float("PDF_TIMEOUT_SECONDS", 15.0),
+        ollama_base_url=ollama_base_url,
+        gemma_model=os.getenv("GEMMA_MODEL", "gemma4:e4b"),
+        frontend_origin=frontend_origin,
+        model_timeout_seconds=_positive_float("MODEL_TIMEOUT_SECONDS", 120.0),
     )
