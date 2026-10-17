@@ -1,6 +1,6 @@
 # PrivacyPal backend
 
-This backend provides a loopback-only FastAPI service for document input, local extraction/OCR, and local Gemma analysis through Ollama. Documents are not sent to a cloud service.
+This backend provides a loopback-only FastAPI service with in-memory session creation, document upload, local extraction/OCR, and local Gemma analysis through Ollama. It accepts pasted text, text-based or scanned PDFs, and PNG, JPEG, or WebP images. Documents are not sent to a cloud service; an answer-provider integration is not implemented.
 
 PDF parsing uses `pypdf` in an isolated worker. Scanned PDF pages and PNG, JPEG, and WebP images use local Tesseract OCR. Gemma uses Ollama's native tool-call API to select bounded relevant passages and answer locally. Initial limits are 10 MiB per upload, 25 PDF pages, 25,000 extracted characters, and a 15-second PDF parsing timeout. Encrypted, malformed, oversized, and unreadable documents are rejected.
 

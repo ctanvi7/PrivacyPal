@@ -38,35 +38,31 @@ Creates temporary state for one user’s local app session.
 }
 ```
 
-## 2. Upload a document or provide pasted text
+## 2. Upload a PDF
 
 `POST /api/v1/sessions/{session_id}/documents`
 
-Accepts either a multipart file upload or JSON pasted text. Exactly one input is supplied per request. Supported file types and upload limits remain configuration/product decisions; the backend validates content and limits before processing.
-
-### Request — pasted text
-
-```json
-{
-  "pasted_text": "Synthetic document text for local analysis"
-}
-```
+Accepts one text-based PDF per request. Pasted text, scanned PDFs, and images are out of scope for this milestone. PDF text is extracted locally with pypdf; OCR is not performed.
 
 ### Request — file
 
 `multipart/form-data` with a `file` part containing the source document.
+
+PDF limits are 10 MiB, 25 pages, 25,000 extracted characters, and 15 seconds for extraction. Encrypted, malformed, empty, and text-empty PDFs are rejected.
 
 ### Response — `201 Created`
 
 ```json
 {
   "document_id": "opaque-document-id",
-  "source_type": "pasted_text",
-  "status": "ready"
+  "source_type": "pdf",
+  "status": "ready",
+  "page_count": 1,
+  "extracted_character_count": 42
 }
 ```
 
-The `source_type` and status values are illustrative proposal values. The backend keeps the source and extracted text in temporary local session state; the API does not return extracted document contents.
+The backend keeps extracted text in in-memory session state. The API does not return extracted document contents. The original file is processed in memory and is not persisted.
 
 ## 3. Ask a question and prepare a draft
 
@@ -172,20 +168,34 @@ Provider destination disclosure must be available to the user before approval. I
 
 ## 6. Consistent error response
 
-All error responses use this shape. HTTP status codes distinguish client, state, local processing, and provider errors; exact mappings remain for team review.
+Errors from the session creation and PDF upload endpoints use this shape. Other endpoint status mappings remain for team review.
 
 ```json
 {
   "error": {
-    "code": "STALE_DRAFT_VERSION",
-    "message": "This request changed. Review the current version before continuing.",
-    "retryable": false,
-    "request_id": "opaque-request-id"
+    "code": "UNKNOWN_SESSION",
+    "message": "The session was not found or has expired."
   }
 }
 ```
 
-`request_id` may be omitted when no request has been created. Messages must be safe for display and must not include stack traces, document text, credentials, prompts, or provider response bodies.
+Session and PDF upload error mappings:
+
+| Status | Code | Meaning |
+|---|---|---|
+| 404 | `UNKNOWN_SESSION` | Session does not exist or has expired |
+| 413 | `FILE_TOO_LARGE` | PDF exceeds 10 MiB |
+| 415 | `UNSUPPORTED_FILE_TYPE` | Request is not exactly one PDF file part with a `.pdf` filename and PDF content type |
+| 422 | `EMPTY_PDF` | No file was supplied or the file is empty |
+| 422 | `INVALID_PDF` | PDF is malformed or unreadable |
+| 422 | `ENCRYPTED_PDF` | PDF is encrypted or password-protected |
+| 422 | `NO_EXTRACTABLE_TEXT` | PDF contains no extractable text |
+| 422 | `TOO_MANY_PAGES` | PDF exceeds 25 pages |
+| 422 | `TEXT_TOO_LONG` | Extracted text exceeds 25,000 characters |
+| 504 | `PDF_EXTRACTION_TIMEOUT` | Extraction exceeds 15 seconds |
+| 500 | `INTERNAL_ERROR` | Unexpected processing error |
+
+All messages must be safe for display and must not include stack traces, document text, credentials, prompts, or provider response bodies. Unexpected errors return no exception details.
 
 ## Privacy and approval rules
 
@@ -205,11 +215,10 @@ The pitch flow must use live Gemma inference with real tool calls and a real con
 
 This document is a proposal, not an agreed implementation contract. Members 1 and 2 should review and decide:
 
-- Supported upload formats, pasted-text limits, file/page limits, and extraction/OCR behavior.
-- Whether OCR is included in the MVP, given the current documentation conflict.
+- Pasted-text limits and OCR support beyond the text-based PDF upload milestone.
 - Whether endpoints run synchronously or need polling/streaming based on measured model latency.
 - Session transport and protection details, including cookie/token handling and CSRF/origin checks.
 - Exact finding and risk-flag categories, severity values, and which risks block approval versus require user review.
 - Provider/model selection, user-visible destination details, provider payload shape, credential configuration, and provider-specific response handling.
-- HTTP status mappings, error codes, and retryability semantics, especially for provider timeout or uncertain delivery.
+- HTTP status mappings, error codes, and retryability semantics for endpoints beyond session creation and PDF upload, especially provider timeout or uncertain delivery.
 - Whether optional features such as placeholder restoration and source references are in scope and how they fit the API.

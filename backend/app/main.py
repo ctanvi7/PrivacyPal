@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import time
 from dataclasses import dataclass
 from urllib.parse import urlparse
@@ -16,7 +15,12 @@ from pydantic import BaseModel, Field
 from starlette.datastructures import UploadFile
 
 from app.config import get_settings
-from app.extraction.document_service import ExtractionError, ExtractedDocument, extract_pasted_text, extract_upload
+from app.extraction.document_service import (
+    ExtractedDocument,
+    ExtractionError,
+    extract_pasted_text,
+    extract_upload,
+)
 from app.model.ollama_adapter import ModelError, OllamaAnalyzer
 
 settings = get_settings()
@@ -56,13 +60,21 @@ class SessionStore:
 
     def _expire_idle(self) -> None:
         now = time.monotonic()
-        for key in [key for key, value in self.items.items() if now - value.touched_at > self.idle_seconds]:
+        expired = [
+            key
+            for key, value in self.items.items()
+            if now - value.touched_at > self.idle_seconds
+        ]
+        for key in expired:
             del self.items[key]
 
     def create(self) -> str:
         self._expire_idle()
         if len(self.items) >= self.max_sessions:
-            raise HTTPException(status_code=429, detail="Too many active local sessions. Clear one and try again.")
+            raise HTTPException(
+                status_code=429,
+                detail="Too many active local sessions. Clear one and try again.",
+            )
         session_id = str(uuid4())
         self.items[session_id] = Session(touched_at=time.monotonic())
         return session_id
@@ -71,8 +83,9 @@ class SessionStore:
         self._expire_idle()
         if session_id not in self.items:
             raise HTTPException(status_code=404, detail="Session expired. Start a new session.")
-        self.items[session_id].touched_at = time.monotonic()
-        return self.items[session_id]
+        session = self.items[session_id]
+        session.touched_at = time.monotonic()
+        return session
 
 
 sessions = SessionStore()
@@ -80,23 +93,68 @@ sessions = SessionStore()
 
 @app.middleware("http")
 async def local_browser_origin(request: Request, call_next):
-    if request.method in {"POST", "PUT", "PATCH", "DELETE"} and request.headers.get("origin") != settings.frontend_origin:
-        return JSONResponse(status_code=403, content={"error": {"code": "LOCAL_ORIGIN_REQUIRED", "message": "Request must come from the local PrivacyPal interface.", "retryable": False}})
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"} and request.headers.get(
+        "origin"
+    ) != settings.frontend_origin:
+        return _error(
+            403,
+            "LOCAL_ORIGIN_REQUIRED",
+            "Request must come from the local PrivacyPal interface.",
+        )
     host = urlparse(f"//{request.headers.get('host', '')}").hostname
     if host and host.lower() not in {"127.0.0.1", "localhost", "::1", "testserver"}:
-        return JSONResponse(status_code=403, content={"error": {"code": "LOCAL_HOST_REQUIRED", "message": "PrivacyPal accepts local connections only.", "retryable": False}})
+        return _error(403, "LOCAL_HOST_REQUIRED", "PrivacyPal accepts local connections only.")
     return await call_next(request)
 
 
 @app.exception_handler(HTTPException)
 async def http_error_handler(_request: Request, exc: HTTPException) -> JSONResponse:
-    code = {404: "SESSION_EXPIRED", 409: "INVALID_STATE", 422: "INVALID_INPUT", 429: "TOO_MANY_SESSIONS", 503: "LOCAL_ANALYSIS_FAILED"}.get(exc.status_code, "REQUEST_FAILED")
-    return JSONResponse(status_code=exc.status_code, content={"error": {"code": code, "message": str(exc.detail), "retryable": False}})
+    code = {
+        404: "UNKNOWN_SESSION",
+        409: "INVALID_STATE",
+        422: "INVALID_INPUT",
+        429: "TOO_MANY_SESSIONS",
+        503: "LOCAL_ANALYSIS_FAILED",
+    }.get(exc.status_code, "REQUEST_FAILED")
+    message = str(exc.detail) if exc.status_code < 500 else "The request could not be completed."
+    return _error(exc.status_code, code, message)
 
 
 @app.exception_handler(RequestValidationError)
-async def validation_error_handler(_request: Request, _exc: RequestValidationError) -> JSONResponse:
-    return JSONResponse(status_code=422, content={"error": {"code": "INVALID_INPUT", "message": "Check the supplied text and try again.", "retryable": False}})
+async def validation_error_handler(
+    _request: Request, _exc: RequestValidationError
+) -> JSONResponse:
+    return _error(422, "INVALID_INPUT", "Check the supplied input and try again.")
+
+
+def _error(status_code: int, code: str, message: str) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content={"error": {"code": code, "message": message}},
+    )
+
+
+def _map_extraction_error(error: ExtractionError) -> JSONResponse:
+    """Map extraction failures to safe API errors without exposing parser details."""
+
+    message = str(error).casefold()
+    if "upload limit" in message:
+        return _error(413, "FILE_TOO_LARGE", "The upload exceeds the 10 MiB size limit.")
+    if "time limit" in message or "timeout" in message:
+        return _error(504, "PDF_EXTRACTION_TIMEOUT", "PDF extraction exceeded the 15-second time limit.")
+    if "password-protected" in message or "encrypted" in message:
+        return _error(422, "ENCRYPTED_PDF", "Encrypted or password-protected PDFs are not supported.")
+    if "page limit" in message:
+        return _error(422, "TOO_MANY_PAGES", "The PDF exceeds the 25-page limit.")
+    if "character limit" in message:
+        return _error(422, "TEXT_TOO_LONG", "Extracted text exceeds the 25,000-character limit.")
+    if "no readable text" in message or "no extractable text" in message:
+        return _error(422, "NO_EXTRACTABLE_TEXT", "No extractable text was found in the document.")
+    if "empty" in message:
+        return _error(422, "EMPTY_PDF", "The uploaded document is empty.")
+    if "type" in message or "choose a pdf" in message or "supported image" in message:
+        return _error(415, "UNSUPPORTED_FILE_TYPE", "Upload a supported document file.")
+    return _error(422, "INVALID_PDF", "The document is malformed or unreadable.")
 
 
 @app.get("/health", tags=["health"])
@@ -110,27 +168,65 @@ async def create_session() -> dict[str, object]:
 
 
 @app.post("/api/v1/sessions/{session_id}/documents", status_code=201)
-async def attach_document(session_id: str, request: Request) -> dict[str, object]:
+async def attach_document(session_id: str, request: Request) -> JSONResponse:
     session = sessions.get(session_id)
     try:
         content_type = request.headers.get("content-type", "").split(";", maxsplit=1)[0].lower()
         if content_type == "application/json":
             payload = PastedText.model_validate(await request.json())
             document = extract_pasted_text(payload.pasted_text)
+        elif content_type == "multipart/form-data":
+            try:
+                form = await request.form(
+                    max_files=2,
+                    max_fields=2,
+                    max_part_size=settings.pdf_max_bytes,
+                )
+            except Exception:
+                return _error(415, "UNSUPPORTED_FILE_TYPE", "Upload exactly one document input.")
+            entries = list(form.multi_items())
+            if len(entries) != 1 or entries[0][0] != "file" or not isinstance(entries[0][1], UploadFile):
+                for _, value in entries:
+                    if isinstance(value, UploadFile):
+                        await value.close()
+                return _error(415, "UNSUPPORTED_FILE_TYPE", "Upload exactly one document in the file part.")
+            file = entries[0][1]
+            try:
+                raw = await file.read(settings.pdf_max_bytes + 1)
+                if len(raw) > settings.pdf_max_bytes:
+                    return _error(413, "FILE_TOO_LARGE", "The upload exceeds the 10 MiB size limit.")
+                document = extract_upload(
+                    raw,
+                    file.content_type or "application/octet-stream",
+                    file.filename or "",
+                    settings=settings,
+                )
+            finally:
+                await file.close()
         else:
-            form = await request.form(max_files=1, max_fields=1, max_part_size=settings.pdf_max_bytes)
-            file = form.get("file")
-            if not isinstance(file, UploadFile):
-                raise ExtractionError("Paste text or choose a PDF, PNG, JPEG, or WebP file.")
-            raw = await file.read(settings.pdf_max_bytes + 1)
-            document = extract_upload(raw, file.content_type or "application/octet-stream", file.filename or "", settings=settings)
+            return _error(415, "UNSUPPORTED_FILE_TYPE", "Upload a supported document file.")
     except ExtractionError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    except Exception as exc:
-        raise HTTPException(status_code=422, detail="The document could not be processed.") from exc
-    session.document_id = str(uuid4())
+        return _map_extraction_error(exc)
+    except RequestValidationError:
+        return _error(422, "INVALID_INPUT", "Check the supplied input and try again.")
+    except Exception:
+        return _error(500, "INTERNAL_ERROR", "The document could not be processed.")
+
+    document_id = str(uuid4())
+    session.document_id = document_id
     session.document = document
-    return {"document_id": session.document_id, "source_type": document.source_type, "page_count": len(document.pages), "character_count": len(document.text), "status": "ready"}
+    character_count = len(document.text)
+    return JSONResponse(
+        status_code=201,
+        content={
+            "document_id": document_id,
+            "source_type": document.source_type,
+            "page_count": len(document.pages),
+            "character_count": character_count,
+            "extracted_character_count": character_count,
+            "status": "ready",
+        },
+    )
 
 
 @app.post("/api/v1/sessions/{session_id}/questions", status_code=200)
@@ -142,12 +238,24 @@ async def ask_question(session_id: str, payload: Question) -> dict[str, object]:
     if not question:
         raise HTTPException(status_code=422, detail="Enter a question about the document.")
     try:
-        result = await OllamaAnalyzer(settings.ollama_base_url, settings.gemma_model, settings.model_timeout_seconds).analyze(
-            question, [{"page": page.page, "text": page.text} for page in session.document.pages]
+        result = await OllamaAnalyzer(
+            settings.ollama_base_url,
+            settings.gemma_model,
+            settings.model_timeout_seconds,
+        ).analyze(
+            question,
+            [{"page": page.page, "text": page.text} for page in session.document.pages],
         )
     except (ValueError, ModelError) as exc:
-        raise HTTPException(status_code=503, detail="Local Gemma is unavailable or failed its native tool-call check.") from exc
-    return {"answer": result.answer, "pages_used": list(result.pages_used), "analysis_location": "Local Gemma via Ollama"}
+        raise HTTPException(
+            status_code=503,
+            detail="Local Gemma is unavailable or failed its native tool-call check.",
+        ) from exc
+    return {
+        "answer": result.answer,
+        "pages_used": list(result.pages_used),
+        "analysis_location": "Local Gemma via Ollama",
+    }
 
 
 @app.delete("/api/v1/sessions/{session_id}/documents/{document_id}")
