@@ -1,10 +1,10 @@
-"""Loopback-only API for document input and local Gemma analysis."""
+"""Loopback-only API for local privacy review and explicitly approved answers."""
 
 from __future__ import annotations
 
-import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Literal
 from urllib.parse import urlparse
 from uuid import uuid4
 
@@ -18,22 +18,44 @@ from starlette.datastructures import UploadFile
 from app.config import get_settings
 from app.extraction.document_service import ExtractionError, ExtractedDocument, extract_pasted_text, extract_upload
 from app.model.ollama_adapter import ModelError, OllamaAnalyzer
+from app.privacy.pipeline import Finding, PrivacyCheckError, ResidualReview, review_residual_risk, scan_sensitive_data
+from app.provider.answer_provider import ApprovedRequest, OpenAICompatibleProvider, ProviderError
+from app.tools.registry import ToolContext, ToolRegistry, ToolValidationError, privacy_workflow_complete
 
 settings = get_settings()
 MAX_QUESTION_CHARS = 2_000
-app = FastAPI(title="PrivacyPal API", version="0.1.0", docs_url=None, redoc_url=None)
+app = FastAPI(title="PrivacyPal API", version="0.2.0", docs_url=None, redoc_url=None)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[settings.frontend_origin],
-    allow_methods=["GET", "POST", "DELETE"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE"],
     allow_headers=["Content-Type"],
 )
+
+
+@dataclass
+class PrivacyWorkflow:
+    workflow_id: str
+    document_id: str
+    question: str
+    draft: str
+    findings: tuple[Finding, ...]
+    placeholder_map: dict[str, str] = field(repr=False)
+    residual: ResidualReview | None = None
+    contextual_flags: tuple[str, ...] = ()
+    version: int = 1
+    review_complete: bool = True
+    acknowledged: bool = False
+    send_state: Literal["review", "sending", "sent", "delivery_unknown", "cancelled"] = "review"
+    answer: str | None = None
+    pages_used: tuple[int, ...] = ()
 
 
 @dataclass
 class Session:
     document_id: str | None = None
     document: ExtractedDocument | None = None
+    workflow: PrivacyWorkflow | None = None
     touched_at: float = 0.0
 
 
@@ -46,8 +68,21 @@ class Question(BaseModel):
     question: str = Field(min_length=1, max_length=MAX_QUESTION_CHARS)
 
 
+class DraftUpdate(BaseModel):
+    version: int = Field(ge=1)
+    draft: str = Field(min_length=1, max_length=8_000)
+
+
+class WorkflowVersion(BaseModel):
+    version: int = Field(ge=1)
+
+
+class Approval(WorkflowVersion):
+    restore_placeholders: bool = False
+
+
 class SessionStore:
-    """Temporary process-local content. No source text is written to disk or logs."""
+    """Temporary process-local content and workflow state; no content is persisted."""
 
     def __init__(self) -> None:
         self.items: dict[str, Session] = {}
@@ -90,13 +125,48 @@ async def local_browser_origin(request: Request, call_next):
 
 @app.exception_handler(HTTPException)
 async def http_error_handler(_request: Request, exc: HTTPException) -> JSONResponse:
-    code = {404: "SESSION_EXPIRED", 409: "INVALID_STATE", 422: "INVALID_INPUT", 429: "TOO_MANY_SESSIONS", 503: "LOCAL_ANALYSIS_FAILED"}.get(exc.status_code, "REQUEST_FAILED")
+    code = {404: "SESSION_EXPIRED", 409: "INVALID_STATE", 422: "INVALID_INPUT", 429: "TOO_MANY_SESSIONS", 502: "PROVIDER_FAILED", 503: "LOCAL_ANALYSIS_FAILED"}.get(exc.status_code, "REQUEST_FAILED")
     return JSONResponse(status_code=exc.status_code, content={"error": {"code": code, "message": str(exc.detail), "retryable": False}})
 
 
 @app.exception_handler(RequestValidationError)
-async def validation_error_handler(_request: Request, _exc: RequestValidationError) -> JSONResponse:
+async def request_validation_error_handler(_request: Request, _exc: RequestValidationError) -> JSONResponse:
     return JSONResponse(status_code=422, content={"error": {"code": "INVALID_INPUT", "message": "Check the supplied text and try again.", "retryable": False}})
+
+
+def _provider_view() -> dict[str, object]:
+    return {
+        "name": settings.answer_provider_name,
+        "endpoint": settings.answer_provider_url,
+        "configured": bool(settings.answer_provider_url and settings.answer_provider_model and settings.answer_provider_api_key),
+    }
+
+
+def _workflow_view(workflow: PrivacyWorkflow) -> dict[str, object]:
+    residual = workflow.residual
+    return {
+        "workflow_id": workflow.workflow_id,
+        "version": workflow.version,
+        "question": workflow.question,
+        "draft": workflow.draft,
+        "findings": [finding.public_view() for finding in workflow.findings],
+        "residual_review": residual.public_view() if residual else {"status": "needs_review", "findings": [], "reasons": ["Privacy review has not completed."]},
+        "review_complete": workflow.review_complete,
+        "acknowledged": workflow.acknowledged,
+        "send_state": workflow.send_state,
+        "provider": _provider_view(),
+        "pages_used": list(workflow.pages_used),
+    }
+
+
+def _get_workflow(session_id: str, workflow_id: str) -> tuple[Session, PrivacyWorkflow]:
+    session = sessions.get(session_id)
+    workflow = session.workflow
+    if workflow is None or workflow.workflow_id != workflow_id:
+        raise HTTPException(status_code=404, detail="This review is no longer active. Start a new question.")
+    if workflow.document_id != session.document_id:
+        raise HTTPException(status_code=409, detail="The document changed. Start a new review.")
+    return session, workflow
 
 
 @app.get("/health", tags=["health"])
@@ -130,6 +200,7 @@ async def attach_document(session_id: str, request: Request) -> dict[str, object
         raise HTTPException(status_code=422, detail="The document could not be processed.") from exc
     session.document_id = str(uuid4())
     session.document = document
+    session.workflow = None
     return {"document_id": session.document_id, "source_type": document.source_type, "page_count": len(document.pages), "character_count": len(document.text), "status": "ready"}
 
 
@@ -141,13 +212,146 @@ async def ask_question(session_id: str, payload: Question) -> dict[str, object]:
     question = payload.question.strip()
     if not question:
         raise HTTPException(status_code=422, detail="Enter a question about the document.")
+    doc_id = session.document_id
+    document = session.document
+    session.workflow = None
+    context = ToolContext(
+        session_id=session_id,
+        workflow_id=str(uuid4()),
+        question=question,
+        document_pages=tuple({"page": page.page, "text": page.text} for page in document.pages),
+    )
     try:
-        result = await OllamaAnalyzer(settings.ollama_base_url, settings.gemma_model, settings.model_timeout_seconds).analyze(
-            question, [{"page": page.page, "text": page.text} for page in session.document.pages]
+        analyzer = OllamaAnalyzer(settings.ollama_base_url, settings.gemma_model, settings.model_timeout_seconds)
+        await analyzer.run_privacy_workflow(context, ToolRegistry())
+        if not privacy_workflow_complete(context) or context.draft is None or context.residual_review is None:
+            raise ModelError("The local privacy review did not complete.")
+    except (ValueError, ModelError, ToolValidationError) as exc:
+        raise HTTPException(status_code=503, detail="Local Gemma or a required privacy check failed. No request was sent externally.") from exc
+    if session_id not in sessions.items or sessions.items[session_id] is not session or session.document_id != doc_id:
+        raise HTTPException(status_code=409, detail="The session or document changed during local analysis. Start again.")
+    workflow = PrivacyWorkflow(
+        workflow_id=context.workflow_id,
+        document_id=doc_id,
+        question=question,
+        draft=context.draft.text,
+        findings=context.draft.findings,
+        placeholder_map=dict(context.draft.placeholder_map),
+        residual=context.residual_review,
+        contextual_flags=context.contextual_flags,
+        pages_used=context.inspected_pages,
+    )
+    session.workflow = workflow
+    return _workflow_view(workflow)
+
+
+@app.patch("/api/v1/sessions/{session_id}/workflows/{workflow_id}/draft")
+async def edit_draft(session_id: str, workflow_id: str, payload: DraftUpdate) -> dict[str, object]:
+    _, workflow = _get_workflow(session_id, workflow_id)
+    if payload.version != workflow.version or workflow.send_state != "review":
+        raise HTTPException(status_code=409, detail="This review changed or is no longer editable. Reload it before continuing.")
+    text = payload.draft.strip()
+    if not text:
+        raise HTTPException(status_code=422, detail="The reviewed request cannot be empty.")
+    workflow.version += 1
+    target_version = workflow.version
+    workflow.draft = text
+    workflow.acknowledged = False
+    workflow.review_complete = False
+    workflow.residual = ResidualReview("needs_review", (), ("The edited request is being checked locally.",))
+    try:
+        scan = scan_sensitive_data(text)
+        flags = await OllamaAnalyzer(settings.ollama_base_url, settings.gemma_model, settings.model_timeout_seconds).review_edited_draft(workflow.question, text)
+        residual = review_residual_risk(text, contextual_flags=flags, contextual_review_complete=True)
+        findings = scan.findings
+    except PrivacyCheckError:
+        findings = ()
+        flags = ()
+        residual = ResidualReview("blocked", (), ("A required deterministic privacy check could not complete.",))
+    except ModelError:
+        try:
+            findings = scan_sensitive_data(text).findings
+        except PrivacyCheckError:
+            findings = ()
+        flags = ()
+        residual = review_residual_risk(text, contextual_review_complete=False)
+    if workflow.version == target_version and workflow.send_state == "review":
+        workflow.findings = findings
+        workflow.contextual_flags = flags
+        workflow.residual = residual
+        workflow.review_complete = residual.status != "blocked" and not (
+            residual.reasons and residual.reasons[0] == "Contextual residual-risk review did not complete."
         )
-    except (ValueError, ModelError) as exc:
-        raise HTTPException(status_code=503, detail="Local Gemma is unavailable or failed its native tool-call check.") from exc
-    return {"answer": result.answer, "pages_used": list(result.pages_used), "analysis_location": "Local Gemma via Ollama"}
+    return _workflow_view(workflow)
+
+
+@app.post("/api/v1/sessions/{session_id}/workflows/{workflow_id}/acknowledge")
+async def acknowledge_review(session_id: str, workflow_id: str, payload: WorkflowVersion) -> dict[str, object]:
+    _, workflow = _get_workflow(session_id, workflow_id)
+    if payload.version != workflow.version or workflow.send_state != "review":
+        raise HTTPException(status_code=409, detail="This review changed. Check the latest version before acknowledging it.")
+    if not workflow.review_complete or workflow.residual is None or workflow.residual.status == "blocked":
+        raise HTTPException(status_code=409, detail="The required privacy checks have not completed, or a high-risk value is blocked.")
+    workflow.acknowledged = True
+    return _workflow_view(workflow)
+
+
+@app.post("/api/v1/sessions/{session_id}/workflows/{workflow_id}/approve")
+async def approve_and_send(session_id: str, workflow_id: str, payload: Approval) -> dict[str, object]:
+    _, workflow = _get_workflow(session_id, workflow_id)
+    if payload.version != workflow.version or workflow.send_state != "review":
+        raise HTTPException(status_code=409, detail="This approval is stale, already used, or no longer active.")
+    if not _provider_view()["configured"]:
+        raise HTTPException(status_code=503, detail="Configure the answer provider in the backend environment before approving a send.")
+    if not workflow.review_complete or workflow.residual is None or workflow.residual.status == "blocked":
+        raise HTTPException(status_code=409, detail="The privacy checks are incomplete or a high-risk value remains.")
+    if workflow.residual.status == "needs_review" and not workflow.acknowledged:
+        raise HTTPException(status_code=409, detail="Review and acknowledge the remaining privacy warnings first.")
+    try:
+        final_scan = scan_sensitive_data(workflow.draft)
+    except PrivacyCheckError as exc:
+        raise HTTPException(status_code=409, detail="The final privacy check could not complete; nothing was sent.") from exc
+    if any(finding.action == "block" for finding in final_scan.findings):
+        workflow.residual = ResidualReview("blocked", final_scan.findings, ("A high-risk value remains in the exact request.",))
+        workflow.acknowledged = False
+        raise HTTPException(status_code=409, detail="A high-risk value is still present; edit the request before approval.")
+
+    # Consume approval before the first await, so double-clicks/replays cannot send twice.
+    workflow.send_state = "sending"
+    approved = ApprovedRequest(
+        workflow_id=workflow.workflow_id,
+        version=workflow.version,
+        provider_name=settings.answer_provider_name,
+        provider_url=settings.answer_provider_url,
+        content=workflow.draft,
+    )
+    provider = OpenAICompatibleProvider(
+        url=settings.answer_provider_url,
+        model=settings.answer_provider_model,
+        api_key=settings.answer_provider_api_key,
+        timeout_seconds=settings.answer_provider_timeout_seconds,
+    )
+    try:
+        answer = await provider.send(approved)
+    except ProviderError as exc:
+        workflow.send_state = "delivery_unknown"
+        raise HTTPException(status_code=502, detail="The provider failed. Delivery may have occurred; this approval cannot be retried.") from exc
+    if payload.restore_placeholders:
+        for placeholder, original in sorted(workflow.placeholder_map.items(), key=lambda pair: len(pair[0]), reverse=True):
+            answer = answer.replace(placeholder, original)
+    workflow.answer = answer
+    workflow.send_state = "sent"
+    return {"workflow_id": workflow.workflow_id, "version": workflow.version, "answer": answer, "provider": _provider_view(), "pages_used": list(workflow.pages_used), "send_state": workflow.send_state}
+
+
+@app.post("/api/v1/sessions/{session_id}/workflows/{workflow_id}/cancel")
+async def cancel_workflow(session_id: str, workflow_id: str) -> dict[str, str]:
+    session, workflow = _get_workflow(session_id, workflow_id)
+    if workflow.send_state != "review":
+        raise HTTPException(status_code=409, detail="This workflow has already been consumed and cannot be cancelled.")
+    workflow.send_state = "cancelled"
+    session.workflow = None
+    return {"status": "cancelled"}
 
 
 @app.delete("/api/v1/sessions/{session_id}/documents/{document_id}")
@@ -157,6 +361,7 @@ async def remove_document(session_id: str, document_id: str) -> dict[str, str]:
         raise HTTPException(status_code=409, detail="This document is no longer attached to the session.")
     session.document = None
     session.document_id = None
+    session.workflow = None
     return {"status": "removed"}
 
 

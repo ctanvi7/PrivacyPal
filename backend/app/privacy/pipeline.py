@@ -27,8 +27,15 @@ class Finding:
     end: int
     _value: str = field(repr=False)
 
-    def public_view(self) -> dict[str, str]:
-        return {"finding_id": self.finding_id, "category": self.category, "action": self.action, "reason": self.reason}
+    def public_view(self) -> dict[str, object]:
+        return {
+            "finding_id": self.finding_id,
+            "category": self.category,
+            "action": self.action,
+            "reason": self.reason,
+            "start": self.start,
+            "end": self.end,
+        }
 
 
 @dataclass(frozen=True)

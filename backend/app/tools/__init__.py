@@ -6,6 +6,7 @@ from app.tools.registry import (
     ToolValidationError,
     ollama_tool_definitions,
     privacy_workflow_ready,
+    privacy_workflow_complete,
     validate_tool_call,
     validate_tool_sequence,
 )
@@ -16,6 +17,7 @@ __all__ = [
     "ToolValidationError",
     "ollama_tool_definitions",
     "privacy_workflow_ready",
+    "privacy_workflow_complete",
     "validate_tool_call",
     "validate_tool_sequence",
 ]

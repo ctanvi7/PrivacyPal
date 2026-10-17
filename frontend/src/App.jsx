@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 const API = "http://127.0.0.1:8000";
 
@@ -21,9 +21,16 @@ export default function App() {
   const [document, setDocument] = useState(null);
   const [question, setQuestion] = useState("");
   const [messages, setMessages] = useState([]);
+  const [workflow, setWorkflow] = useState(null);
+  const [draftEdit, setDraftEdit] = useState("");
+  const [restorePlaceholders, setRestorePlaceholders] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const fileInput = useRef(null);
+
+  useEffect(() => {
+    if (workflow) setDraftEdit(workflow.draft);
+  }, [workflow?.workflow_id, workflow?.version, workflow?.draft]);
 
   async function getSession() {
     if (sessionId) return sessionId;
@@ -47,6 +54,7 @@ export default function App() {
           })();
       setDocument(await request(`/api/v1/sessions/${id}/documents`, options));
       setMessages([]);
+      setWorkflow(null);
     } catch (err) {
       setError(err.message);
     } finally {
@@ -68,7 +76,7 @@ export default function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ document_id: document.document_id, question: asked }),
       });
-      setMessages((current) => [...current, { role: "assistant", text: result.answer, pages: result.pages_used }]);
+      setWorkflow(result);
     } catch (err) {
       setError(err.message);
     } finally {
@@ -89,6 +97,8 @@ export default function App() {
     setDocument(null);
     setQuestion("");
     setMessages([]);
+    setWorkflow(null);
+    setDraftEdit("");
     setError("");
     if (fileInput.current) fileInput.current.value = "";
     setBusy(false);
@@ -105,7 +115,81 @@ export default function App() {
     }
     setDocument(null);
     setMessages([]);
+    setWorkflow(null);
     setBusy(false);
+  }
+
+  async function saveAndRecheckDraft() {
+    if (!workflow) return;
+    setBusy(true);
+    setError("");
+    try {
+      const result = await request(`/api/v1/sessions/${sessionId}/workflows/${workflow.workflow_id}/draft`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ version: workflow.version, draft: draftEdit }),
+      });
+      setWorkflow(result);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function acknowledgeReview() {
+    if (!workflow) return;
+    setBusy(true);
+    setError("");
+    try {
+      const result = await request(`/api/v1/sessions/${sessionId}/workflows/${workflow.workflow_id}/acknowledge`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ version: workflow.version }),
+      });
+      setWorkflow(result);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function approveAndSend() {
+    if (!workflow) return;
+    setBusy(true);
+    setError("");
+    try {
+      const result = await request(`/api/v1/sessions/${sessionId}/workflows/${workflow.workflow_id}/approve`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ version: workflow.version, restore_placeholders: restorePlaceholders }),
+      });
+      setMessages((current) => [...current, { role: "assistant", text: result.answer, pages: result.pages_used, provider: result.provider.name }]);
+      setWorkflow(null);
+      setDraftEdit("");
+      setRestorePlaceholders(false);
+    } catch (err) {
+      setError(err.message);
+      if (err.message.includes("cannot be retried")) setWorkflow({ ...workflow, send_state: "delivery_unknown" });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function cancelReview() {
+    if (!workflow) return;
+    setBusy(true);
+    setError("");
+    try {
+      await request(`/api/v1/sessions/${sessionId}/workflows/${workflow.workflow_id}/cancel`, { method: "POST" });
+      setWorkflow(null);
+      setDraftEdit("");
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setBusy(false);
+    }
   }
 
   const canAttach = Boolean(file || pastedText.trim());
@@ -137,16 +221,38 @@ export default function App() {
             <div className="message-list">
               {messages.map((message, index) => (
                 <article className={`message ${message.role}`} key={`${index}-${message.role}`}>
-                  <span className="message-label">{message.role === "user" ? "YOU" : "GEMMA · LOCAL"}</span>
+                  <span className="message-label">{message.role === "user" ? "YOU" : `ANSWER · ${message.provider || "AI"}`}</span>
                   <p>{message.text}</p>
                   {message.pages?.length > 0 && <small className="page-reference">Source pages: {message.pages.join(", ")}</small>}
                 </article>
               ))}
-              {busy && document && <div className="activity"><span className="spinner" /> Gemma is checking relevant passages locally…</div>}
+              {busy && document && <div className="activity"><span className="spinner" /> PrivacyPal is checking your request locally…</div>}
             </div>
           )}
           {error && <div className="error-banner" role="alert">{error}</div>}
         </div>
+
+        {workflow && <section className="review-panel" aria-labelledby="review-title">
+          <div className="review-heading"><div><span className="eyebrow">LOCAL PRIVACY REVIEW</span><h2 id="review-title">Review before sending</h2></div><span className={`review-status ${workflow.residual_review?.status}`}>{workflow.residual_review?.status === "ready_for_user_review" ? "Checks complete" : workflow.residual_review?.status === "blocked" ? "Blocked" : "Needs your review"}</span></div>
+          <p className="review-destination">Destination: <strong>{workflow.provider?.name}</strong>{workflow.provider?.endpoint ? <> · <code>{workflow.provider.endpoint}</code></> : " · Not configured"}</p>
+          {!workflow.provider?.configured && <p className="review-note">No answer provider is configured yet. Nothing will be sent until one is configured in the backend environment.</p>}
+          <label className="review-label" htmlFor="outbound-draft">Exact sanitized request</label>
+          <textarea id="outbound-draft" className="review-draft" value={draftEdit} onChange={(event) => setDraftEdit(event.target.value)} maxLength={8000} disabled={busy || workflow.send_state !== "review"} />
+          <p className="review-note">Editing the request runs the local checks again and clears any previous acknowledgement.</p>
+          <div className="finding-list" aria-label="Privacy findings">
+            <strong>Detected and changed details</strong>
+            {workflow.findings?.length ? <ul>{workflow.findings.map((finding) => <li key={finding.finding_id}><span>{finding.category.replaceAll("_", " ")}</span><small>{finding.action === "block" ? "Blocked from the draft" : finding.action === "mask" ? "Masked in the draft" : "Removed from the draft"} · {finding.reason} · original draft characters {finding.start}–{finding.end}</small></li>)}</ul> : <p>No configured pattern was detected. This does not guarantee anonymity.</p>}
+          </div>
+          <div className="residual-review" role="status"><strong>Remaining privacy review</strong><ul>{(workflow.residual_review?.reasons || []).map((reason, index) => <li key={index}>{reason}</li>)}</ul>{!workflow.review_complete && <p>A required privacy check did not complete. Recheck the request before sending.</p>}</div>
+          <label className="restore-option"><input type="checkbox" checked={restorePlaceholders} onChange={(event) => setRestorePlaceholders(event.target.checked)} disabled={busy} /> Restore masked placeholders in the returned answer on this computer</label>
+          <div className="review-actions">
+            <button className="quiet-button" onClick={cancelReview} disabled={busy}>Cancel</button>
+            <button className="quiet-button" onClick={saveAndRecheckDraft} disabled={busy || workflow.send_state !== "review"}>{workflow.review_complete ? "Save edits and recheck" : "Run privacy check again"}</button>
+            {workflow.residual_review?.status === "needs_review" && <button className="quiet-button" onClick={acknowledgeReview} disabled={busy || !workflow.review_complete || workflow.acknowledged}>{workflow.acknowledged ? "Warnings acknowledged" : "I reviewed remaining warnings"}</button>}
+            <button className="primary-button" onClick={approveAndSend} disabled={busy || !workflow.provider?.configured || !workflow.review_complete || workflow.residual_review?.status === "blocked" || workflow.send_state !== "review" || (workflow.residual_review?.status === "needs_review" && !workflow.acknowledged)}>{busy ? "Processing…" : "Approve and send"}</button>
+          </div>
+          {workflow.send_state === "delivery_unknown" && <p className="review-note danger-note">Delivery status is unknown. Do not retry this request; start a new question only after checking the provider.</p>}
+        </section>}
 
         <div className="composer-area">
           {document ? (
@@ -165,7 +271,7 @@ export default function App() {
             <textarea id="question" placeholder={document ? "Ask a question about your document…" : "Add a document to start asking…"} value={question} onChange={(event) => setQuestion(event.target.value)} disabled={!document || busy} maxLength={2000} rows={2} />
             <div className="question-bottom"><span>{document ? "Your question and relevant passages are analyzed locally." : "Your document is needed before you can ask."}</span><button className="send-button" aria-label="Send question" disabled={!document || !question.trim() || busy}>↑</button></div>
           </form>
-          <p className="disclosure">Document processing and Gemma analysis run locally through Ollama.</p>
+          <p className="disclosure">Document reading and privacy checks run locally. An external provider receives only the reviewed request after you approve it.</p>
         </div>
       </section>
     </main>

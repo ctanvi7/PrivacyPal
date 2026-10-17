@@ -55,6 +55,7 @@ class ToolContext:
     selected: SelectedContent | None = None
     draft: SanitizedDraft | None = None
     residual_review: ResidualReview | None = None
+    contextual_flags: tuple[str, ...] = ()
     executed_tools: list[str] = field(default_factory=list)
 
     @property
@@ -139,6 +140,7 @@ class ToolRegistry:
             if context.draft is None:
                 raise ToolValidationError("A sanitized draft is required before residual review.")
             categories = call.arguments["risk_categories"]
+            context.contextual_flags = tuple(categories)
             context.residual_review = review_residual_risk(
                 context.draft.text,
                 # The review module maps these controlled categories to safe UI text.
@@ -287,4 +289,18 @@ def privacy_workflow_ready(context: ToolContext) -> bool:
         and context.draft is not None
         and context.residual_review is not None
         and context.residual_review.status == "ready_for_user_review"
+    )
+
+
+def privacy_workflow_complete(context: ToolContext) -> bool:
+    """True when all local steps ran and the residual check is reviewable."""
+    return (
+        context.executed_tools == list(_TOOL_ORDER)
+        and context.scan is not None
+        and context.scan.complete
+        and context.selected is not None
+        and context.selected.status == "selected"
+        and context.draft is not None
+        and context.residual_review is not None
+        and context.residual_review.status in {"ready_for_user_review", "needs_review"}
     )

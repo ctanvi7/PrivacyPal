@@ -1,6 +1,6 @@
 # Run the local document flow
 
-PrivacyPal currently implements document upload or pasted text, local extraction/OCR, and local Gemma analysis through Ollama. Sensitive-data minimization, review/approval, and an external answer provider are not part of this implementation yet.
+PrivacyPal supports document upload or pasted text, local extraction/OCR, Gemma-guided local privacy checks, a sanitized-request review and approval gate, and an optional OpenAI-compatible answer provider. No external request is made until the current draft passes required checks and the user approves it.
 
 ## Requirements
 
@@ -22,6 +22,12 @@ $env:APP_PORT = "8000"
 $env:FRONTEND_ORIGIN = "http://127.0.0.1:5173"
 $env:OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 $env:GEMMA_MODEL = "gemma4:e4b"
+# Optional: configure an OpenAI-compatible answer service before launching the backend.
+# Keep the API key private; never commit it or paste it into chat.
+$env:ANSWER_PROVIDER_NAME = "Your chosen provider"
+$env:ANSWER_PROVIDER_URL = "https://provider.example/v1/chat/completions"
+$env:ANSWER_PROVIDER_MODEL = "your-model-name"
+$env:ANSWER_PROVIDER_API_KEY = "your-private-key"
 python backend/run.py
 ```
 
@@ -43,4 +49,6 @@ Open the local address Vite prints, normally `http://127.0.0.1:5173`.
 - Encrypted, unreadable, unsupported, empty, or over-limit documents stop with an error. There is no cloud extraction or OCR fallback.
 - Documents and extracted text stay in temporary in-memory sessions. Sessions expire after 30 minutes idle, when cleared, or when the backend stops.
 
-The first Gemma request must return Ollama's native `inspect_document` tool-call structure. The backend validates its tool name and arguments and returns only bounded matching passages to a second local Gemma call. It rejects text that merely imitates a tool call.
+Gemma runs a sequence of five native, allowlisted local tool calls for inspection, sensitive-data checks, relevance selection, sanitization, and residual review. Any missing, malformed, repeated, or out-of-order call fails closed. The review screen shows the exact draft and configured destination. Editing the draft increments its version, clears acknowledgement, and re-runs local deterministic and Gemma checks. Remaining warnings require explicit acknowledgement. High-risk patterns block approval. Approval is consumed before the provider call and cannot be replayed; ambiguous provider failures are not retried.
+
+The provider URL must use HTTPS. The provider name and endpoint are shown before approval. The adapter sends one user message containing only the approved sanitized draft and does not send source text or placeholder mappings. Placeholder restoration, if selected, happens locally on the returned answer.
