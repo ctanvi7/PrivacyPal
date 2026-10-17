@@ -89,6 +89,7 @@ def test_question_only_runs_local_and_provider_receives_exact_approved_sanitized
         json={"version": review["version"], "restore_placeholders": False},
     )
     assert response.status_code == 200, response.text
+    assert response.json()["history_saved"] is True
     assert len(sent) == 1
     assert sent[0].content == review["draft"]
     assert sent[0].provider_name == "Test Provider"
@@ -102,6 +103,13 @@ def test_question_only_runs_local_and_provider_receives_exact_approved_sanitized
     )
     assert replay.status_code == 409
     assert len(sent) == 1
+    history = client.get(
+        f"/api/v1/conversations/{main.sessions.items[session_id].conversation_id}",
+        headers=ORIGIN,
+    ).json()
+    assert [message["role"] for message in history["messages"]] == ["user", "assistant"]
+    assert history["messages"][0]["content"] == "What is the salary?"
+    assert history["messages"][1]["content"] == "The salary is 80000 annually."
 
 
 def test_edit_requires_fresh_review_and_acknowledgement(client, monkeypatch):
@@ -180,11 +188,16 @@ def test_high_risk_value_added_by_edit_is_blocked(client, monkeypatch):
 
 def test_cancel_discards_workflow_without_provider_call(client):
     session_id, review = start_workflow(client)
+    workflow = main.sessions.items[session_id].workflow
     cancelled = client.post(
         f"/api/v1/sessions/{session_id}/workflows/{review['workflow_id']}/cancel",
         headers=ORIGIN,
     )
     assert cancelled.status_code == 200
+    assert main.sessions.items[session_id].workflow is None
+    assert workflow.question == ""
+    assert workflow.draft == ""
+    assert workflow.placeholder_map == {}
     stale = client.post(
         f"/api/v1/sessions/{session_id}/workflows/{review['workflow_id']}/approve",
         headers=ORIGIN,
@@ -219,3 +232,25 @@ def test_unconfigured_provider_cannot_be_approved(client, monkeypatch):
     )
     assert response.status_code == 503
     assert sent == []
+
+
+def test_failed_provider_call_does_not_persist_sensitive_question_or_answer(client, monkeypatch):
+    class FailedProvider:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def send(self, _approved):
+            raise main.ProviderError("synthetic private provider failure")
+
+    monkeypatch.setattr(main, "OpenAICompatibleProvider", FailedProvider)
+    session_id, review = start_workflow(client)
+    response = client.post(
+        f"/api/v1/sessions/{session_id}/workflows/{review['workflow_id']}/approve",
+        headers=ORIGIN,
+        json={"version": review["version"]},
+    )
+    assert response.status_code == 502
+    assert "What is the salary?" not in response.text
+    conversation_id = main.sessions.items[session_id].conversation_id
+    history = client.get(f"/api/v1/conversations/{conversation_id}", headers=ORIGIN).json()
+    assert history["messages"] == []

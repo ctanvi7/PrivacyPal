@@ -1,216 +1,311 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import time
+from dataclasses import replace
 
 import pytest
 from fastapi.testclient import TestClient
 
+import app.main as main
 from app.extraction.document_service import ExtractedDocument, PageText
 from app.main import Session, app, sessions
-from app.model.ollama_adapter import Analysis
-
-ORIGIN = "http://127.0.0.1:5173"
-SOURCE_TEXT = "Private original document text which must never reach the provider."
+from app.model.ollama_adapter import ModelError
+from app.privacy.pipeline import ResidualReview
 
 
-@dataclass
+ORIGIN = {"Origin": "http://127.0.0.1:5173"}
+SOURCE_TEXT = "Synthetic monthly report: rent is 1200 and utilities are 180."
+
+
+def _tool(name: str, arguments: dict | None = None) -> dict:
+    return {"function": {"name": name, "arguments": arguments or {}}}
+
+
+async def _fake_local_workflow(_self, context, registry):
+    calls = [
+        _tool("inspect_document", {"terms": ["rent"]}),
+        _tool("detect_sensitive_data"),
+        _tool("select_relevant_content"),
+        _tool("propose_sanitized_request"),
+        _tool("review_residual_risk", {"risk_categories": []}),
+    ]
+    for call in calls:
+        registry.execute(call, context)
+    return context
+
+
+async def _fake_edited_review(_self, _question: str, _draft: str):
+    return ()
+
+
 class FakeProvider:
-    answer_text: str = "Synthetic provider answer"
+    answer_text = "Synthetic provider answer"
     failure: Exception | None = None
+    calls: list[str] = []
 
-    def __post_init__(self) -> None:
-        self.calls: list[str] = []
+    def __init__(self, **_kwargs):
+        pass
 
-    async def answer(self, approved_text: str) -> str:
-        self.calls.append(approved_text)
-        if self.failure is not None:
+    async def send(self, approved):
+        self.calls.append(approved.content)
+        if self.failure:
             raise self.failure
         return self.answer_text
 
 
-class FakeAnalyzer:
-    def __init__(self, *_args, **_kwargs) -> None:
-        pass
-
-    async def analyze(self, _question: str, _pages: list[dict[str, object]]) -> Analysis:
-        return Analysis(answer="The synthetic monthly total is 1200.", pages_used=(1,))
-
-
 @pytest.fixture
-def client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
+def client(monkeypatch: pytest.MonkeyPatch):
     sessions.items.clear()
-    app.state.answer_provider = None
-    monkeypatch.setattr("app.main.OllamaAnalyzer", FakeAnalyzer)
+    FakeProvider.calls = []
+    FakeProvider.failure = None
+    FakeProvider.answer_text = "Synthetic provider answer"
+    monkeypatch.setattr(main.OllamaAnalyzer, "run_privacy_workflow", _fake_local_workflow)
+    monkeypatch.setattr(main.OllamaAnalyzer, "review_edited_draft", _fake_edited_review)
+    monkeypatch.setattr(main, "OpenAICompatibleProvider", FakeProvider)
+    monkeypatch.setattr(
+        main,
+        "settings",
+        replace(
+            main.settings,
+            answer_provider_name="Test Provider",
+            answer_provider_url="https://example.test/v1/chat/completions",
+            answer_provider_model="test-model",
+            answer_provider_api_key="test-only-key",
+        ),
+    )
     with TestClient(app) as test_client:
         yield test_client
     sessions.items.clear()
-    app.state.answer_provider = None
 
 
-def _headers() -> dict[str, str]:
-    return {"Origin": ORIGIN}
-
-
-def _session_and_draft(client: TestClient) -> tuple[str, dict[str, object]]:
-    session_response = client.post("/api/v1/sessions", headers=_headers())
-    session_id = session_response.json()["session_id"]
+def _session_and_draft(
+    client: TestClient,
+    source_text: str = SOURCE_TEXT,
+    question: str = "What are the monthly costs?",
+) -> tuple[str, dict]:
+    session_response = client.post("/api/v1/sessions", headers=ORIGIN)
+    session_data = session_response.json()
+    session_id = session_data["session_id"]
     sessions.items[session_id] = Session(
         document_id="synthetic-document",
-        document=ExtractedDocument((PageText(1, SOURCE_TEXT),), "pdf"),
+        document=ExtractedDocument((PageText(1, source_text),), "pdf"),
         touched_at=time.monotonic(),
+        conversation_id=session_data["conversation_id"],
     )
-    draft_response = client.post(
-        f"/api/v1/sessions/{session_id}/requests",
-        headers=_headers(),
-        json={"document_id": "synthetic-document", "question": "What is the monthly total?"},
+    response = client.post(
+        f"/api/v1/sessions/{session_id}/questions",
+        headers=ORIGIN,
+        json={"document_id": "synthetic-document", "question": question},
     )
-    assert draft_response.status_code == 201
-    return session_id, draft_response.json()
+    assert response.status_code == 200, response.text
+    return session_id, response.json()
 
 
-def test_unapproved_and_cancelled_request_never_calls_provider(client: TestClient) -> None:
-    provider = FakeProvider()
-    app.state.answer_provider = provider
-    session_id, draft = _session_and_draft(client)
-
-    cancel_response = client.post(
-        f"/api/v1/sessions/{session_id}/requests/{draft['request_id']}/cancel",
-        headers=_headers(),
+def test_unapproved_and_cancelled_workflow_never_calls_provider(client: TestClient):
+    session_id, review = _session_and_draft(client)
+    cancelled = client.post(
+        f"/api/v1/sessions/{session_id}/workflows/{review['workflow_id']}/cancel",
+        headers=ORIGIN,
     )
-    assert cancel_response.status_code == 200
-    approve_response = client.post(
-        f"/api/v1/sessions/{session_id}/requests/{draft['request_id']}/approve",
-        headers=_headers(),
-        json={"draft_version": 1, "approved": True},
+    assert cancelled.status_code == 200
+    approve = client.post(
+        f"/api/v1/sessions/{session_id}/workflows/{review['workflow_id']}/approve",
+        headers=ORIGIN,
+        json={"version": review["version"]},
     )
+    assert approve.status_code == 404
+    assert FakeProvider.calls == []
 
-    assert approve_response.status_code == 409
-    assert provider.calls == []
 
-
-def test_approval_sends_only_exact_approved_text(client: TestClient) -> None:
-    provider = FakeProvider()
-    app.state.answer_provider = provider
-    session_id, draft = _session_and_draft(client)
-    edit_text = "Summarize the monthly costs without identifying the source."
+def test_approval_sends_exact_current_draft_once_and_persists_answer(client: TestClient):
+    session_id, review = _session_and_draft(client)
+    expected = "Summarize the monthly costs without identifying the source."
     edited = client.patch(
-        f"/api/v1/sessions/{session_id}/requests/{draft['request_id']}",
-        headers=_headers(),
-        json={"expected_draft_version": 1, "proposed_request": edit_text},
+        f"/api/v1/sessions/{session_id}/workflows/{review['workflow_id']}/draft",
+        headers=ORIGIN,
+        json={"version": review["version"], "draft": expected},
     )
     assert edited.status_code == 200
-
+    assert edited.json()["draft"] == expected
     response = client.post(
-        f"/api/v1/sessions/{session_id}/requests/{draft['request_id']}/approve",
-        headers=_headers(),
-        json={"draft_version": 2, "approved": True},
+        f"/api/v1/sessions/{session_id}/workflows/{review['workflow_id']}/approve",
+        headers=ORIGIN,
+        json={"version": edited.json()["version"]},
     )
-
     assert response.status_code == 200
     assert response.json()["answer"] == "Synthetic provider answer"
-    assert provider.calls == [edit_text]
-    assert SOURCE_TEXT not in provider.calls[0]
-    changed_after_approval = client.patch(
-        f"/api/v1/sessions/{session_id}/requests/{draft['request_id']}",
-        headers=_headers(),
-        json={"expected_draft_version": 2, "proposed_request": "Changed after approval."},
+    assert response.json()["history_saved"] is True
+    assert FakeProvider.calls == [expected]
+    active_session = sessions.items[session_id]
+    assert active_session.document is None
+    assert active_session.document_id is None
+    assert active_session.workflow.question == ""
+    assert active_session.workflow.draft == ""
+
+    replay = client.post(
+        f"/api/v1/sessions/{session_id}/workflows/{review['workflow_id']}/approve",
+        headers=ORIGIN,
+        json={"version": review["version"]},
     )
-    assert changed_after_approval.status_code == 409
-    assert provider.calls == [edit_text]
+    assert replay.status_code == 409
+    assert FakeProvider.calls == [expected]
+    history = client.get(
+        f"/api/v1/conversations/{sessions.items[session_id].conversation_id}", headers=ORIGIN
+    ).json()
+    assert [message["role"] for message in history["messages"]] == ["user", "assistant"]
 
 
-def test_stale_approval_version_does_not_call_provider(client: TestClient) -> None:
-    provider = FakeProvider()
-    app.state.answer_provider = provider
-    session_id, draft = _session_and_draft(client)
-    client.patch(
-        f"/api/v1/sessions/{session_id}/requests/{draft['request_id']}",
-        headers=_headers(),
-        json={"expected_draft_version": 1, "proposed_request": "A revised safe summary."},
+def test_stale_draft_version_cannot_be_approved(client: TestClient):
+    session_id, review = _session_and_draft(client)
+    edited = client.patch(
+        f"/api/v1/sessions/{session_id}/workflows/{review['workflow_id']}/draft",
+        headers=ORIGIN,
+        json={"version": review["version"], "draft": "A safe revised monthly cost summary."},
     )
+    assert edited.status_code == 200
+    stale = client.post(
+        f"/api/v1/sessions/{session_id}/workflows/{review['workflow_id']}/approve",
+        headers=ORIGIN,
+        json={"version": review["version"]},
+    )
+    assert stale.status_code == 409
+    assert FakeProvider.calls == []
+
+
+def test_high_risk_secret_blocks_approval_and_never_reaches_provider(client: TestClient):
+    session_id, review = _session_and_draft(client)
+    secret = "synthetic-api-key-DO_NOT_SEND-12345"
+    edited = client.patch(
+        f"/api/v1/sessions/{session_id}/workflows/{review['workflow_id']}/draft",
+        headers=ORIGIN,
+        json={
+            "version": review["version"],
+            "draft": f"Safe monthly summary. API key: {secret}",
+        },
+    )
+    assert edited.status_code == 200
+    assert edited.json()["residual_review"]["status"] == "blocked"
 
     response = client.post(
-        f"/api/v1/sessions/{session_id}/requests/{draft['request_id']}/approve",
-        headers=_headers(),
-        json={"draft_version": 1, "approved": True},
+        f"/api/v1/sessions/{session_id}/workflows/{review['workflow_id']}/approve",
+        headers=ORIGIN,
+        json={"version": edited.json()["version"]},
     )
-
     assert response.status_code == 409
-    assert provider.calls == []
+    assert secret not in response.text
+    assert FakeProvider.calls == []
+    conversation_id = sessions.items[session_id].conversation_id
+    history = client.get(f"/api/v1/conversations/{conversation_id}", headers=ORIGIN).json()
+    assert history["messages"] == []
 
 
-def test_high_risk_secret_fails_review_and_never_calls_provider(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    provider = FakeProvider()
-    app.state.answer_provider = provider
+def test_document_analysis_rejects_detected_high_risk_secret_safely(client: TestClient, monkeypatch):
+    secret = "synthetic-api-key-DO_NOT_SEND-12345"
 
-    class SecretAnalyzer(FakeAnalyzer):
-        async def analyze(self, _question: str, _pages: list[dict[str, object]]) -> Analysis:
-            return Analysis(answer="The document includes api_key=synthetic-secret-value", pages_used=(1,))
+    async def reject_detected_secret(_self, context, registry):
+        # Run the real deterministic detector against synthetic document text.
+        registry.execute(_tool("detect_sensitive_data"), context)
+        assert context.scan is not None
+        assert any(item.category == "credential" and item.action == "block" for item in context.scan.findings)
+        raise ModelError("A high-risk value was detected during local analysis.")
 
-    monkeypatch.setattr("app.main.OllamaAnalyzer", SecretAnalyzer)
-    session_response = client.post("/api/v1/sessions", headers=_headers())
-    session_id = session_response.json()["session_id"]
+    monkeypatch.setattr(main.OllamaAnalyzer, "run_privacy_workflow", reject_detected_secret)
+    session_response = client.post("/api/v1/sessions", headers=ORIGIN)
+    session_data = session_response.json()
+    session_id = session_data["session_id"]
     sessions.items[session_id] = Session(
         document_id="synthetic-document",
-        document=ExtractedDocument((PageText(1, SOURCE_TEXT),), "pdf"),
+        document=ExtractedDocument(
+            (PageText(1, f"Monthly report. API key: {secret}"),), "pdf"
+        ),
         touched_at=time.monotonic(),
+        conversation_id=session_data["conversation_id"],
     )
 
     response = client.post(
-        f"/api/v1/sessions/{session_id}/requests",
-        headers=_headers(),
-        json={"document_id": "synthetic-document", "question": "What is the total?"},
-    )
-
-    assert response.status_code == 422
-    assert response.json()["error"]["code"] == "PRIVACY_CHECK_FAILED"
-    assert "synthetic-secret-value" not in response.text
-    assert provider.calls == []
-
-
-def test_provider_failure_is_safe_and_not_retried(client: TestClient) -> None:
-    from app.answer_provider import AnswerProviderError
-
-    provider = FakeProvider(failure=AnswerProviderError())
-    app.state.answer_provider = provider
-    session_id, draft = _session_and_draft(client)
-    response = client.post(
-        f"/api/v1/sessions/{session_id}/requests/{draft['request_id']}/approve",
-        headers=_headers(),
-        json={"draft_version": 1, "approved": True},
-    )
-    retry = client.post(
-        f"/api/v1/sessions/{session_id}/requests/{draft['request_id']}/approve",
-        headers=_headers(),
-        json={"draft_version": 1, "approved": True},
-    )
-
-    assert response.status_code == 502
-    assert response.json() == {
-        "error": {
-            "code": "ANSWER_PROVIDER_FAILED",
-            "message": "The answer provider could not complete the request.",
-        }
-    }
-    assert "synthetic provider failure" not in response.text
-    assert retry.status_code == 409
-    assert len(provider.calls) == 1
-
-
-def test_missing_provider_configuration_fails_without_sending(client: TestClient) -> None:
-    session_id, draft = _session_and_draft(client)
-
-    response = client.post(
-        f"/api/v1/sessions/{session_id}/requests/{draft['request_id']}/approve",
-        headers=_headers(),
-        json={"draft_version": 1, "approved": True},
+        f"/api/v1/sessions/{session_id}/questions",
+        headers=ORIGIN,
+        json={"document_id": "synthetic-document", "question": "Summarize this report."},
     )
 
     assert response.status_code == 503
-    assert response.json()["error"]["code"] == "ANSWER_PROVIDER_NOT_CONFIGURED"
-    assert response.json()["error"]["message"] == (
-        "Select an answer provider and configure its server-side credentials before approval."
+    assert secret not in response.text
+    assert "No request was sent externally." in response.text
+    assert FakeProvider.calls == []
+    conversation_id = session_data["conversation_id"]
+    history = client.get(f"/api/v1/conversations/{conversation_id}", headers=ORIGIN)
+    assert history.status_code == 200
+    assert history.json()["messages"] == []
+
+
+def test_incomplete_review_cannot_be_approved(client: TestClient):
+    session_id, review = _session_and_draft(client)
+    workflow = sessions.items[session_id].workflow
+    workflow.review_complete = False
+    workflow.residual = ResidualReview("blocked", (), ("Synthetic blocked review.",))
+    response = client.post(
+        f"/api/v1/sessions/{session_id}/workflows/{review['workflow_id']}/approve",
+        headers=ORIGIN,
+        json={"version": review["version"]},
     )
+    assert response.status_code == 409
+    assert FakeProvider.calls == []
+
+
+def test_provider_failure_is_safe_single_use_and_not_persisted(client: TestClient):
+    from app.provider.answer_provider import ProviderError
+
+    FakeProvider.failure = ProviderError("synthetic private provider response")
+    session_id, review = _session_and_draft(client)
+    path = f"/api/v1/sessions/{session_id}/workflows/{review['workflow_id']}/approve"
+    response = client.post(path, headers=ORIGIN, json={"version": review["version"]})
+    retry = client.post(path, headers=ORIGIN, json={"version": review["version"]})
+    assert response.status_code == 502
+    assert "synthetic private provider response" not in response.text
+    assert retry.status_code == 409
+    assert len(FakeProvider.calls) == 1
+    assert sessions.items[session_id].document is None
+    conversation_id = sessions.items[session_id].conversation_id
+    history = client.get(f"/api/v1/conversations/{conversation_id}", headers=ORIGIN).json()
+    assert history["messages"] == []
+
+
+def test_high_risk_provider_answer_is_withheld_and_not_persisted(client: TestClient):
+    secret = "synthetic-api-key-DO_NOT_SEND-12345"
+    FakeProvider.answer_text = f"The document contains API key: {secret}"
+    session_id, review = _session_and_draft(client)
+
+    response = client.post(
+        f"/api/v1/sessions/{session_id}/workflows/{review['workflow_id']}/approve",
+        headers=ORIGIN,
+        json={"version": review["version"]},
+    )
+    retry = client.post(
+        f"/api/v1/sessions/{session_id}/workflows/{review['workflow_id']}/approve",
+        headers=ORIGIN,
+        json={"version": review["version"]},
+    )
+
+    assert response.status_code == 502
+    assert secret not in response.text
+    assert retry.status_code == 409
+    assert FakeProvider.calls == [review["draft"]]
+    conversation_id = sessions.items[session_id].conversation_id
+    history = client.get(f"/api/v1/conversations/{conversation_id}", headers=ORIGIN).json()
+    assert history["messages"] == []
+
+
+def test_missing_provider_configuration_blocks_approval(client: TestClient, monkeypatch):
+    monkeypatch.setattr(
+        main,
+        "settings",
+        replace(main.settings, answer_provider_url="", answer_provider_model="", answer_provider_api_key=""),
+    )
+    session_id, review = _session_and_draft(client)
+    response = client.post(
+        f"/api/v1/sessions/{session_id}/workflows/{review['workflow_id']}/approve",
+        headers=ORIGIN,
+        json={"version": review["version"]},
+    )
+    assert response.status_code == 503
+    assert FakeProvider.calls == []

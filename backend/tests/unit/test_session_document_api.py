@@ -104,7 +104,7 @@ def test_create_session_returns_contract_response(client: TestClient) -> None:
     )
 
     assert response.status_code == 201
-    assert set(response.json()) == {"session_id", "expires_in_seconds"}
+    assert set(response.json()) == {"session_id", "expires_in_seconds", "conversation_id"}
     assert response.json()["expires_in_seconds"] == 1800
 
 
