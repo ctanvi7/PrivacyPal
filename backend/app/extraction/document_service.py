@@ -7,7 +7,7 @@ from io import BytesIO
 from pathlib import PurePath
 from typing import Literal
 
-import fitz
+import pymupdf as fitz
 from PIL import Image, UnidentifiedImageError
 from app.config import Settings, get_settings
 from app.extraction.pdf_service import PdfDocumentError, PdfTextExtractionService
