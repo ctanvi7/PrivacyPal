@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+import re
 from urllib.parse import urlparse
 from uuid import uuid4
 
@@ -15,6 +16,12 @@ from pydantic import BaseModel, Field
 from starlette.datastructures import UploadFile
 
 from app.config import get_settings
+from app.answer_provider import (
+    AnswerProvider,
+    AnswerProviderError,
+    AnswerProviderNotConfigured,
+    require_provider_configuration,
+)
 from app.extraction.document_service import (
     ExtractedDocument,
     ExtractionError,
@@ -25,6 +32,15 @@ from app.model.ollama_adapter import ModelError, OllamaAnalyzer
 
 settings = get_settings()
 MAX_QUESTION_CHARS = 2_000
+MAX_DRAFT_CHARS = 8_000
+EMAIL_PATTERN = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
+PHONE_PATTERN = re.compile(r"(?<!\w)\+?\d[\d\s().-]{7,}\d(?!\w)")
+SECRET_PATTERNS = (
+    re.compile(r"\b(?:password|passwd|api[_ -]?key|access[_ -]?token|secret)\s*[:=]\s*\S+", re.IGNORECASE),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),
+    re.compile(r"\bBearer\s+[A-Za-z0-9._~+/-]{16,}", re.IGNORECASE),
+)
 app = FastAPI(title="PrivacyPal API", version="0.1.0", docs_url=None, redoc_url=None)
 app.add_middleware(
     CORSMiddleware,
@@ -39,6 +55,23 @@ class Session:
     document_id: str | None = None
     document: ExtractedDocument | None = None
     touched_at: float = 0.0
+    requests: dict[str, "ReviewRequest"] | None = None
+
+    def __post_init__(self) -> None:
+        if self.requests is None:
+            self.requests = {}
+
+
+@dataclass
+class ReviewRequest:
+    proposed_request: str
+    findings: list[dict[str, str]]
+    risk_flags: list[dict[str, str]]
+    privacy_check: str
+    draft_version: int = 1
+    status: str = "awaiting_review"
+    answer: str | None = None
+    approved_text: str | None = None
 
 
 class PastedText(BaseModel):
@@ -48,6 +81,16 @@ class PastedText(BaseModel):
 class Question(BaseModel):
     document_id: str = Field(min_length=1, max_length=80)
     question: str = Field(min_length=1, max_length=MAX_QUESTION_CHARS)
+
+
+class EditRequest(BaseModel):
+    expected_draft_version: int = Field(ge=1)
+    proposed_request: str = Field(min_length=1, max_length=MAX_DRAFT_CHARS)
+
+
+class Approval(BaseModel):
+    draft_version: int = Field(ge=1)
+    approved: bool
 
 
 class SessionStore:
@@ -89,6 +132,7 @@ class SessionStore:
 
 
 sessions = SessionStore()
+app.state.answer_provider = None
 
 
 @app.middleware("http")
@@ -155,6 +199,56 @@ def _map_extraction_error(error: ExtractionError) -> JSONResponse:
     if "type" in message or "choose a pdf" in message or "supported image" in message:
         return _error(415, "UNSUPPORTED_FILE_TYPE", "Upload a supported document file.")
     return _error(422, "INVALID_PDF", "The document is malformed or unreadable.")
+
+
+def _review_outbound_text(text: str) -> tuple[str, list[dict[str, str]], bool]:
+    """Mask common identifiers and fail closed on obvious high-risk credentials."""
+
+    if any(pattern.search(text) for pattern in SECRET_PATTERNS):
+        return text, [], False
+
+    findings: list[dict[str, str]] = []
+    sanitized = EMAIL_PATTERN.sub(lambda match: _record_mask(findings, "email", match.group()), text)
+    sanitized = PHONE_PATTERN.sub(lambda match: _record_mask(findings, "phone", match.group()), sanitized)
+    return sanitized, findings, True
+
+
+def _record_mask(findings: list[dict[str, str]], kind: str, _value: str) -> str:
+    findings.append(
+        {
+            "category": "personal_identifier",
+            "action": "masked",
+            "description": f"A personal {kind} was replaced.",
+        }
+    )
+    return f"[{kind.upper()}]"
+
+
+def _find_request(session: Session, request_id: str) -> ReviewRequest:
+    request = session.requests.get(request_id) if session.requests is not None else None
+    if request is None:
+        raise HTTPException(status_code=404, detail="Request was not found in this session.")
+    return request
+
+
+def _request_payload(request_id: str, draft: ReviewRequest) -> dict[str, object]:
+    return {
+        "request_id": request_id,
+        "status": draft.status,
+        "draft_version": draft.draft_version,
+        "proposed_request": draft.proposed_request,
+        "findings": draft.findings,
+        "risk_flags": draft.risk_flags,
+        "privacy_check": draft.privacy_check,
+    }
+
+
+def _answer_provider() -> AnswerProvider:
+    provider = app.state.answer_provider
+    if provider is not None:
+        return provider
+    require_provider_configuration(settings.answer_provider_name, settings.answer_provider_api_key)
+    raise AnswerProviderNotConfigured
 
 
 @app.get("/health", tags=["health"])
@@ -256,6 +350,153 @@ async def ask_question(session_id: str, payload: Question) -> dict[str, object]:
         "pages_used": list(result.pages_used),
         "analysis_location": "Local Gemma via Ollama",
     }
+
+
+@app.post("/api/v1/sessions/{session_id}/requests", status_code=201)
+async def create_review_request(session_id: str, payload: Question) -> JSONResponse:
+    session = sessions.get(session_id)
+    if session.document is None or payload.document_id != session.document_id:
+        raise HTTPException(status_code=409, detail="Add a document before preparing a request.")
+    try:
+        analysis = await OllamaAnalyzer(
+            settings.ollama_base_url,
+            settings.gemma_model,
+            settings.model_timeout_seconds,
+        ).analyze(
+            payload.question.strip(),
+            [{"page": page.page, "text": page.text} for page in session.document.pages],
+        )
+    except (ValueError, ModelError) as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Local Gemma is unavailable or failed its native tool-call check.",
+        ) from exc
+
+    document_text = session.document.text.strip()
+    summary = analysis.answer.strip()
+    if document_text and (summary == document_text or document_text in summary):
+        return _error(422, "PRIVACY_CHECK_FAILED", "The local review could not safely minimize the document text.")
+    candidate = f"Answer this question: {payload.question.strip()}\nRelevant information: {summary}"
+    if document_text and document_text in candidate:
+        return _error(422, "PRIVACY_CHECK_FAILED", "The local review could not safely minimize the document text.")
+    sanitized, findings, passed = _review_outbound_text(candidate)
+    if not passed:
+        return _error(422, "PRIVACY_CHECK_FAILED", "The proposed request contains a high-risk secret.")
+
+    request_id = str(uuid4())
+    draft = ReviewRequest(
+        proposed_request=sanitized,
+        findings=findings,
+        risk_flags=[],
+        privacy_check="passed",
+    )
+    session.requests[request_id] = draft
+    return JSONResponse(status_code=201, content=_request_payload(request_id, draft))
+
+
+@app.patch("/api/v1/sessions/{session_id}/requests/{request_id}")
+async def edit_review_request(
+    session_id: str,
+    request_id: str,
+    payload: EditRequest,
+) -> JSONResponse:
+    session = sessions.get(session_id)
+    draft = _find_request(session, request_id)
+    if draft.status != "awaiting_review":
+        raise HTTPException(status_code=409, detail="This request can no longer be edited.")
+    if payload.expected_draft_version != draft.draft_version:
+        raise HTTPException(status_code=409, detail="Review the latest request version before editing.")
+
+    sanitized, findings, passed = _review_outbound_text(payload.proposed_request)
+    draft.draft_version += 1
+    draft.answer = None
+    draft.approved_text = None
+    if not passed:
+        draft.status = "blocked"
+        draft.privacy_check = "failed"
+        draft.findings = []
+        draft.proposed_request = ""
+        return _error(422, "PRIVACY_CHECK_FAILED", "The edited request contains a high-risk secret.")
+    draft.proposed_request = sanitized
+    draft.findings = findings
+    draft.risk_flags = []
+    draft.privacy_check = "passed"
+    return JSONResponse(status_code=200, content=_request_payload(request_id, draft))
+
+
+@app.post("/api/v1/sessions/{session_id}/requests/{request_id}/cancel")
+async def cancel_review_request(session_id: str, request_id: str) -> dict[str, str]:
+    session = sessions.get(session_id)
+    draft = _find_request(session, request_id)
+    if draft.status != "awaiting_review":
+        raise HTTPException(status_code=409, detail="This request can no longer be cancelled.")
+    draft.status = "cancelled"
+    draft.approved_text = None
+    return {"request_id": request_id, "status": draft.status}
+
+
+@app.post("/api/v1/sessions/{session_id}/requests/{request_id}/approve")
+async def approve_review_request(
+    session_id: str,
+    request_id: str,
+    payload: Approval,
+) -> JSONResponse:
+    session = sessions.get(session_id)
+    draft = _find_request(session, request_id)
+    if not payload.approved:
+        raise HTTPException(status_code=409, detail="Explicit approval is required before sending.")
+    if draft.status != "awaiting_review":
+        raise HTTPException(status_code=409, detail="This request is no longer awaiting approval.")
+    if payload.draft_version != draft.draft_version:
+        raise HTTPException(status_code=409, detail="Review the current request version before approving.")
+    if draft.privacy_check != "passed":
+        raise HTTPException(status_code=409, detail="The privacy review did not pass.")
+
+    try:
+        provider = _answer_provider()
+    except AnswerProviderNotConfigured:
+        return _error(
+            503,
+            "ANSWER_PROVIDER_NOT_CONFIGURED",
+            "Select an answer provider and configure its server-side credentials before approval.",
+        )
+
+    approved_text = draft.proposed_request
+    draft.approved_text = approved_text
+    draft.status = "sending"
+    try:
+        answer = await provider.answer(approved_text)
+    except AnswerProviderError as exc:
+        draft.status = "delivery_status_unknown" if exc.delivery_unknown else "provider_failed"
+        code = "DELIVERY_STATUS_UNKNOWN" if exc.delivery_unknown else "ANSWER_PROVIDER_FAILED"
+        message = (
+            "The provider may have received the request, but its result is unknown. Do not retry automatically."
+            if exc.delivery_unknown
+            else "The answer provider could not complete the request."
+        )
+        return _error(502, code, message)
+    except Exception:
+        draft.status = "delivery_status_unknown"
+        return _error(
+            502,
+            "DELIVERY_STATUS_UNKNOWN",
+            "The provider may have received the request, but its result is unknown. Do not retry automatically.",
+        )
+
+    if not isinstance(answer, str) or not answer.strip():
+        draft.status = "provider_failed"
+        return _error(502, "ANSWER_PROVIDER_FAILED", "The answer provider returned an unusable response.")
+    draft.answer = answer
+    draft.status = "completed"
+    return JSONResponse(
+        status_code=200,
+        content={
+            "request_id": request_id,
+            "status": "completed",
+            "draft_version": draft.draft_version,
+            "answer": answer,
+        },
+    )
 
 
 @app.delete("/api/v1/sessions/{session_id}/documents/{document_id}")
