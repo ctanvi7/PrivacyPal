@@ -41,7 +41,7 @@ SECRET_PATTERNS = (
     re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),
     re.compile(r"\bBearer\s+[A-Za-z0-9._~+/-]{16,}", re.IGNORECASE),
 )
-app = FastAPI(title="PrivacyPal API", version="0.1.0", docs_url=None, redoc_url=None)
+app = FastAPI(title="PrivacyPal API", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[settings.frontend_origin],
