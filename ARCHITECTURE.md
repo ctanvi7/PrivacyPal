@@ -236,14 +236,14 @@ Route names may be adapted to the existing repository, but preserve these behavi
 
 | Operation | Purpose |
 |---|---|
-| POST /api/session | Create an ephemeral session and return safe session metadata |
-| POST /api/session/{id}/document | Upload a supported file or paste text and extract locally |
-| POST /api/session/{id}/questions | Start local analysis for a question |
-| GET /api/session/{id}/requests/{requestId} | Read status and safe review data for this session |
-| PATCH /api/session/{id}/requests/{requestId} | Edit the draft or privacy decisions; invalidate checks and approval |
-| POST /api/session/{id}/requests/{requestId}/approve | Validate approval and, if valid, call the provider |
-| POST /api/session/{id}/requests/{requestId}/cancel | Cancel a request waiting for review |
-| POST /api/session/{id}/clear | Clear session state and temporary files |
+| POST /api/v1/sessions | Create an ephemeral session and return safe session metadata |
+| POST /api/v1/sessions/{session_id}/documents | Upload a text-based PDF and extract locally |
+| POST /api/v1/sessions/{session_id}/requests | Start local analysis for a question |
+| GET /api/v1/sessions/{session_id}/requests/{request_id} | Read status and safe review data for this session |
+| PATCH /api/v1/sessions/{session_id}/requests/{request_id} | Edit the draft or privacy decisions; invalidate checks and approval |
+| POST /api/v1/sessions/{session_id}/requests/{request_id}/approve | Validate approval and, if valid, call the provider |
+| POST /api/v1/sessions/{session_id}/requests/{request_id}/cancel | Cancel a request waiting for review |
+| POST /api/v1/sessions/{session_id}/clear | Clear session state and temporary files |
 
 Every route must validate session ownership, input size, and workflow state. Do not expose an endpoint for arbitrary tool execution. Use structured error codes and user-safe messages; never return stack traces, prompts, credentials, or sensitive document values.
 
