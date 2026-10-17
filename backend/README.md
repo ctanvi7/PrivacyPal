@@ -1,6 +1,6 @@
 # PrivacyPal backend
 
-This backend provides a local FastAPI health endpoint and an independently testable service for extracting text from text-based PDFs. API routes, OCR, Gemma, and answer-provider integration are not implemented yet.
+This backend provides a local FastAPI health endpoint, in-memory session creation, PDF upload, and an independently testable service for extracting text from text-based PDFs. OCR, Gemma, and answer-provider integration are not implemented yet.
 
 The PDF service uses `pypdf` locally. Initial limits follow `SECURITY.md`: 10 MiB per PDF, 25 pages, 25,000 extracted characters, and a 15-second parsing timeout. These values can be configured with `PDF_MAX_BYTES`, `PDF_MAX_PAGES`, `PDF_MAX_CHARS`, and `PDF_TIMEOUT_SECONDS`. Encrypted, malformed, oversized, and text-empty PDFs are rejected; this service does not perform OCR.
 
