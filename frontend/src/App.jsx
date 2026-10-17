@@ -3,6 +3,7 @@ import { createDocumentUploadController } from './lib/documentUploadController.j
 import { createQuestionController } from './lib/questionController.js';
 import { createPrivacyReviewController } from './lib/privacyReview.js';
 import { privacyPalApi } from './lib/privacyPalApi.js';
+import { getPrivacyProgress } from './lib/privacyProgress.js';
 import { createInitialWorkflowState, workflowReducer } from './lib/workflow.js';
 import PrivacyReviewPanel from './components/PrivacyReviewPanel.jsx';
 
@@ -65,13 +66,12 @@ function FileChip({ file, sample = false, uploaded = false, onRemove }) {
 
 function ReviewTimeline({ mode, uploadStatus, questionStatus, workflowResponse }) {
   const sample = mode === 'preview';
-  const steps = sample ? [
-    ['Read PDF', 'Example · extracted text from 1 page'], ['Find sensitive details', 'Example · 3 details identified'], ['Keep answer facts', 'Example · 2 relevant facts selected'], ['Check remaining clues', 'Example · review not performed'],
-  ] : [
-    ['Document upload', uploadStatus === 'uploaded' ? 'Confirmed by local service' : uploadStatus === 'uploading' ? 'Uploading to local service' : 'Select a document to begin'],
-    ['Local privacy analysis', workflowResponse ? workflowResponse.review_complete ? 'Backend reports review complete' : 'Backend reports review incomplete' : questionStatus === 'processing' ? 'Processing with local backend' : questionStatus === 'processing-error' || questionStatus === 'cancelled' ? 'Request stopped; retry if available' : 'Not started'],
-  ];
-  return <div className={`review-steps ${sample ? 'is-sample' : ''}`} aria-label={sample ? 'Illustrative review steps' : 'Privacy review steps'}>{steps.map(([title, detail], i) => <div className="timeline-item" key={title}><span className={`step-number ${sample ? '' : 'incomplete'}`}>{sample ? <Icon name="check" size={16}/> : i + 1}</span><div><strong>{title}</strong>{sample && <time>10:24 AM</time>}<p>{detail}</p></div></div>)}</div>;
+  const steps = getPrivacyProgress({ uploadStatus, questionStatus, workflowResponse, illustrativePreview: sample });
+  const symbols = { completed: <Icon name="check" size={16}/>, failed: <Icon name="close" size={15}/> };
+  return <div className={`review-steps ${sample ? 'is-sample' : ''}`} aria-label={sample ? 'Illustrative workflow progress' : 'Privacy workflow progress'}>{steps.map((step, index) => <div className="timeline-item" data-status={step.status} key={step.id}>
+    <span className={`step-number ${step.status}`} data-status={step.status} role="img" aria-label={`${step.title}: ${step.status}`} title={step.status}>{symbols[step.status] || index + 1}</span>
+    <div><strong>{step.title}</strong><p>{step.detail}</p></div>
+  </div>)}</div>;
 }
 
 function EmptyConversation({ onChoose }) {
@@ -184,7 +184,12 @@ function App() {
     <aside className="sidebar glass-panel" aria-label="Conversation navigation">
       <a className="brand" href="#home" onClick={event => { event.preventDefault(); startNewChat(); }} aria-label="PrivacyPal home"><span className="brand-mark"><PrivacyPalLogo size={40}/></span><span><strong>PrivacyPal</strong><small>Privacy in your control.</small></span></a>
       <button className="new-chat" type="button" onClick={startNewChat}><span className="plus-disc"><Icon name="plus" size={20}/></span><b>New chat</b><kbd>Ctrl N</kbd></button>
-      <nav className="recent-list" aria-label="Recent chats"><p className="nav-label">Today · sample history</p><button className={`recent ${hasPreview ? 'active' : ''}`} type="button" onClick={openPreview}><Icon name="chat" size={18}/><span>Rent affordability <small className="recent-sample">Illustrative preview</small></span><time>10:24 AM</time></button><p className="nav-label previous-label">Previous 7 days · examples</p>{['Home loan options','Tax saving ideas','Compare mutual funds'].map((item, i) => <button className="recent" type="button" key={item} onClick={() => setNotice('This conversation is not stored in this frontend yet.')}><Icon name="chat" size={17}/><span>{item}</span><time>Oct {28-i*2}</time></button>)}</nav>
+      <nav className="recent-list" aria-label="Conversation navigation">
+        <p className="nav-label">Today</p><p className="recent-empty">No saved conversations</p>
+        <p className="nav-label previous-label">Previous 7 days</p><p className="recent-empty">No saved conversations</p>
+        <p className="nav-label preview-label">Illustrative preview</p>
+        <button className={`recent ${hasPreview ? 'active' : ''}`} type="button" onClick={openPreview}><Icon name="chat" size={18}/><span>Rent affordability <small className="recent-sample">Demo content · not saved</small></span></button>
+      </nav>
       <div className="local-status"><span className="gemma-icon" aria-hidden="true"><Icon name="cube" size={35}/></span><div><strong>Local analysis · {uploadState.status === 'uploaded' ? 'ready' : 'backend'}</strong><p>{uploadState.status === 'uploaded' ? 'Document confirmed by local service.' : 'Document and question processing run through the local backend.'}</p></div><span className="status-orb" aria-label={uploadState.status === 'uploaded' ? 'Document ready' : 'Local backend status'}/></div>
       <div className="side-links"><button type="button" onClick={() => setNotice('Settings are not available in this frontend yet.')}><Icon name="settings" size={18}/>Settings</button><button type="button" onClick={() => setNotice('Help and feedback are not connected yet.')}><span className="help-icon"><Icon name="help" size={14}/></span>Help &amp; feedback</button></div>
     </aside>

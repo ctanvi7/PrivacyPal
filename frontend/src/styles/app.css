@@ -73,3 +73,14 @@ body{background-color:#0b0910;background-image:radial-gradient(ellipse 560px 480
 .local-status{background:linear-gradient(145deg,rgba(35,33,42,.92),rgba(25,23,32,.94));border-color:rgba(190,185,201,.18)}
 .control-note{background:linear-gradient(145deg,rgba(43,39,52,.94),rgba(31,28,38,.96));border-color:rgba(171,112,199,.43);box-shadow:inset 0 1px rgba(255,255,255,.075),0 8px 20px rgba(0,0,0,.2)}
 
+/* Workflow states keep the existing timeline design while distinguishing actual progress. */
+.step-number.pending{background:rgba(26,25,31,.92);border-color:rgba(210,199,224,.48);color:#ddd4e4;box-shadow:none}
+.step-number.in-progress{animation:privacy-progress-pulse 1.8s ease-in-out infinite}
+.step-number.completed{background:radial-gradient(circle at 30% 24%,#c449ef,#711ab1 76%);border-color:rgba(237,193,255,.88)}
+.step-number.failed{background:radial-gradient(circle at 30% 24%,#793642,#3d1e29 76%);border-color:rgba(255,158,175,.82);color:#ffe6eb;box-shadow:0 0 8px rgba(225,90,124,.2)}
+.timeline-item[data-status="pending"]:not(:last-child):before{background:rgba(210,199,224,.24);box-shadow:none}
+.timeline-item[data-status="failed"]:not(:last-child):before{background:linear-gradient(180deg,rgba(225,120,145,.72),rgba(145,71,96,.4));box-shadow:0 0 5px rgba(225,90,124,.2)}
+.recent-empty{margin:0 5px;padding:1px 0 0;color:#b9b2c0;font-size:11px;line-height:1.45}
+.preview-label{margin-top:20px}
+@keyframes privacy-progress-pulse{50%{box-shadow:0 0 13px rgba(181,53,224,.62)}}
+@media(prefers-reduced-motion:reduce){.step-number.in-progress{animation:none}}
