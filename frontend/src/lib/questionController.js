@@ -57,13 +57,14 @@ export function createQuestionController({ submitQuestion, timeoutMs = 60_000 } 
     return publish({ ...state, status: 'cancelled', error: { code: 'cancelled', message: 'Question submission cancelled.', retryable: true } });
   }
 
-  function submit({ question = state.question, uploadedDocument } = {}) {
+  function submit({ question = state.question, uploadedDocument, session, uploadedSessionId } = {}) {
     if (active) return active.promise;
     const normalizedQuestion = typeof question === 'string' ? question.trim() : '';
     if (!normalizedQuestion) {
       return Promise.resolve(publish({ ...state, question: typeof question === 'string' ? question : '', status: 'validation-error', result: null, error: { code: 'empty_question', message: EMPTY_QUESTION, retryable: false } }));
     }
-    if (!uploadedDocument) {
+    if (!session || typeof session.session_id !== 'string' || !uploadedDocument ||
+        typeof uploadedDocument.document_id !== 'string' || uploadedSessionId !== session.session_id) {
       return Promise.resolve(publish({ ...state, question: normalizedQuestion, status: 'blocked', result: null, error: { code: 'upload_required', message: UPLOAD_REQUIRED, retryable: false } }));
     }
     if (typeof submitQuestion !== 'function') {
@@ -81,7 +82,7 @@ export function createQuestionController({ submitQuestion, timeoutMs = 60_000 } 
     operation.promise = Promise.resolve()
       .then(() => {
         if (currentSequence !== sequence || controller.signal.aborted) return null;
-        return submitQuestion(normalizedQuestion, uploadedDocument, { signal: controller.signal });
+        return submitQuestion(normalizedQuestion, uploadedDocument, { signal: controller.signal, session });
       })
       .then(result => {
         if (currentSequence !== sequence || controller.signal.aborted) return null;
@@ -106,9 +107,9 @@ export function createQuestionController({ submitQuestion, timeoutMs = 60_000 } 
     return operation.promise;
   }
 
-  function retry({ uploadedDocument } = {}) {
+  function retry({ uploadedDocument, session, uploadedSessionId } = {}) {
     if (!state.error?.retryable) return Promise.resolve(state);
-    return submit({ question: state.question, uploadedDocument });
+    return submit({ question: state.question, uploadedDocument, session, uploadedSessionId });
   }
 
   return Object.freeze({

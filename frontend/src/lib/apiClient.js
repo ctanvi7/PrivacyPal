@@ -2,16 +2,9 @@ export const DEFAULT_API_BASE_URL = 'http://127.0.0.1:8000';
 export const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 
 export const WORKFLOW_API_CONTRACT = Object.freeze({
-  implemented: false,
-  required: Object.freeze([
-    'session creation, cookie and CSRF behavior',
-    'document upload fields, limits, and response schema',
-    'question submission and asynchronous processing status schema',
-    'privacy findings, review decisions, risk flags, and exact request schema',
-    'request edit and revalidation behavior',
-    'explicit approval payload and answer/citation response schema',
-    'structured error codes and safe user-facing messages',
-  ]),
+  implemented: true,
+  connected: Object.freeze(['session creation', 'document upload', 'local question analysis']),
+  pending: Object.freeze(['draft editing', 'acknowledgement', 'approval and answer delivery']),
 });
 
 export class ApiError extends Error {
@@ -39,6 +32,13 @@ function messageForStatus(status) {
   if (status === 429) return 'The service is busy. Wait a moment and try again.';
   if (status >= 500) return 'The local service could not complete the request. Try again later.';
   return 'The request could not be completed.';
+}
+
+function safeBackendMessage(message) {
+  if (typeof message !== 'string') return null;
+  const candidate = message.trim();
+  if (!candidate || candidate.length > 240 || /[\r\n]|traceback|stack trace|authorization:|bearer\s|api[_ -]?key|-----BEGIN|provider response| at [\w.$]+\s*\(/i.test(candidate)) return null;
+  return candidate;
 }
 
 async function readResponse(response) {
@@ -121,10 +121,14 @@ export function createApiClient({
       });
       const data = await readResponse(response);
       if (!response.ok) {
-        throw new ApiError(messageForStatus(response.status), {
-          code: 'http_error',
+        const apiError = data && typeof data === 'object' && !Array.isArray(data) ? data.error : null;
+        const safeMessage = safeBackendMessage(apiError?.message) || messageForStatus(response.status);
+        throw new ApiError(safeMessage, {
+          code: typeof apiError?.code === 'string' ? apiError.code : 'http_error',
           status: response.status,
-          retryable: response.status === 408 || response.status === 429 || response.status >= 500,
+          retryable: typeof apiError?.retryable === 'boolean'
+            ? apiError.retryable
+            : response.status === 408 || response.status === 429 || response.status >= 500,
         });
       }
       return data;

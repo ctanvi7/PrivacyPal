@@ -8,7 +8,9 @@ function initialState() {
   return {
     status: 'empty',
     selectedFile: null,
+    session: null,
     uploadedDocument: null,
+    uploadedSessionId: null,
     error: null,
   };
 }
@@ -21,11 +23,10 @@ function safeUploadError(error) {
 }
 
 /**
- * Coordinates local selection and an injected, contract-specific uploader.
- * No endpoint or request payload is assumed here. The uploader must resolve
- * only after the backend confirms the uploaded document.
+ * Coordinates validated selection, session creation, and server-confirmed upload.
  */
 export function createDocumentUploadController({
+  createSession,
   uploadDocument,
   validate = getDocumentValidationError,
   timeoutMs = 30_000,
@@ -63,7 +64,9 @@ export function createDocumentUploadController({
     return publish({
       status: 'selected',
       selectedFile: file,
+      session: null,
       uploadedDocument: null,
+      uploadedSessionId: null,
       error: null,
     });
   }
@@ -80,6 +83,7 @@ export function createDocumentUploadController({
       ...state,
       status: state.selectedFile ? 'cancelled' : 'empty',
       uploadedDocument: null,
+      uploadedSessionId: null,
       error: { code: 'cancelled', message: 'Upload cancelled. You can retry when ready.', retryable: true },
     });
   }
@@ -93,7 +97,7 @@ export function createDocumentUploadController({
       }));
     }
     if (state.status === 'uploaded') return Promise.resolve(state.uploadedDocument);
-    if (typeof uploadDocument !== 'function') {
+    if (typeof createSession !== 'function' || typeof uploadDocument !== 'function') {
       publish({
         ...state,
         status: 'unavailable',
@@ -110,7 +114,9 @@ export function createDocumentUploadController({
       ? setTimeout(() => { timedOut = true; controller.abort(); }, timeoutMs)
       : null;
 
-    publish({ ...state, status: 'uploading', uploadedDocument: null, error: null });
+    const selectedFile = state.selectedFile;
+    let session = state.session;
+    publish({ ...state, status: 'uploading', uploadedDocument: null, uploadedSessionId: null, error: null });
     const operation = {
       controller,
       timer,
@@ -119,11 +125,25 @@ export function createDocumentUploadController({
     operation.promise = Promise.resolve()
       .then(() => {
         if (currentSequence !== sequence || controller.signal.aborted) return null;
-        return uploadDocument(state.selectedFile, { signal: controller.signal });
+        return (async () => {
+          if (!session) {
+            session = await createSession({ signal: controller.signal });
+            if (currentSequence !== sequence || controller.signal.aborted) return null;
+            if (!session || typeof session.session_id !== 'string' || !session.session_id) {
+              throw new ApiError('The local service returned an invalid session response.', { code: 'invalid_response' });
+            }
+            publish({ ...state, session, status: 'uploading', error: null });
+          }
+          const document = await uploadDocument(session.session_id, selectedFile, { signal: controller.signal });
+          if (!document || typeof document.document_id !== 'string' || !document.document_id) {
+            throw new ApiError('The local service did not confirm the uploaded document.', { code: 'invalid_response' });
+          }
+          return document;
+        })();
       })
       .then(uploadedDocument => {
         if (currentSequence !== sequence || controller.signal.aborted) return null;
-        publish({ ...state, status: 'uploaded', uploadedDocument, error: null });
+        publish({ ...state, session, status: 'uploaded', uploadedDocument, uploadedSessionId: session.session_id, error: null });
         return uploadedDocument;
       })
       .catch(error => {
@@ -133,6 +153,7 @@ export function createDocumentUploadController({
             ...state,
             status: 'upload-error',
             uploadedDocument: null,
+            uploadedSessionId: null,
             error: { code: 'timeout', message: 'Upload timed out. Check your connection and try again.', retryable: true },
           });
         } else if (controller.signal.aborted || error?.name === 'AbortError') {
@@ -140,10 +161,11 @@ export function createDocumentUploadController({
             ...state,
             status: 'cancelled',
             uploadedDocument: null,
+            uploadedSessionId: null,
             error: { code: 'cancelled', message: 'Upload cancelled. You can retry when ready.', retryable: true },
           });
         } else {
-          publish({ ...state, status: 'upload-error', uploadedDocument: null, error: safeUploadError(error) });
+          publish({ ...state, status: 'upload-error', uploadedDocument: null, uploadedSessionId: null, error: safeUploadError(error) });
         }
         return null;
       })

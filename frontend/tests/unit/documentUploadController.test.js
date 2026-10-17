@@ -4,12 +4,14 @@ import { ApiError } from '../../src/lib/apiClient.js';
 import { createDocumentUploadController } from '../../src/lib/documentUploadController.js';
 
 const validFile = { name: 'statement.pdf', type: 'application/pdf', size: 1024 };
+const createSession = async () => ({ session_id: 'session-1', expires_in_seconds: 1800 });
 
 test('keeps selection separate until the injected uploader confirms success', async () => {
-  const confirmed = { id: 'server-confirmed-document' };
+  const confirmed = { document_id: 'server-confirmed-document', status: 'ready' };
   let receivedFile;
   const controller = createDocumentUploadController({
-    uploadDocument: async file => { receivedFile = file; return confirmed; },
+    createSession,
+    uploadDocument: async (_sessionId, file) => { receivedFile = file; return confirmed; },
   });
 
   controller.select(validFile);
@@ -22,12 +24,15 @@ test('keeps selection separate until the injected uploader confirms success', as
   assert.equal(result, confirmed);
   assert.equal(controller.getState().status, 'uploaded');
   assert.equal(controller.getState().uploadedDocument, confirmed);
+  assert.equal(controller.getState().session.session_id, 'session-1');
+  assert.equal(controller.getState().uploadedSessionId, 'session-1');
 });
 
 test('prevents duplicate uploads and returns the same in-flight operation', async () => {
   let finishUpload;
   let calls = 0;
   const controller = createDocumentUploadController({
+    createSession,
     uploadDocument: () => {
       calls += 1;
       return new Promise(resolve => { finishUpload = resolve; });
@@ -39,20 +44,48 @@ test('prevents duplicate uploads and returns the same in-flight operation', asyn
   const second = controller.upload();
   assert.equal(first, second);
   assert.equal(calls, 0, 'injected upload starts on the next microtask');
-  await Promise.resolve();
+  await new Promise(resolve => setImmediate(resolve));
   assert.equal(calls, 1);
-  finishUpload({ id: 'confirmed' });
+  finishUpload({ document_id: 'confirmed' });
   await first;
+  assert.equal(controller.getState().status, 'uploaded');
+});
+
+test('creates a session before upload and retries without claiming upload on session failure', async () => {
+  let sessions = 0;
+  let uploads = 0;
+  const controller = createDocumentUploadController({
+    createSession: async () => {
+      sessions += 1;
+      if (sessions === 1) throw new ApiError('Local service unavailable.', { code: 'network_error', retryable: true });
+      return { session_id: 'session-retry', expires_in_seconds: 1800 };
+    },
+    uploadDocument: async sessionId => {
+      uploads += 1;
+      assert.equal(sessionId, 'session-retry');
+      return { document_id: 'confirmed', status: 'ready' };
+    },
+  });
+  controller.select(validFile);
+  await controller.upload();
+  assert.equal(controller.getState().status, 'upload-error');
+  assert.equal(controller.getState().session, null);
+  assert.equal(controller.getState().uploadedDocument, null);
+  assert.equal(uploads, 0);
+  await controller.retry();
+  assert.equal(sessions, 2);
+  assert.equal(uploads, 1);
   assert.equal(controller.getState().status, 'uploaded');
 });
 
 test('supports retry after a recoverable server failure', async () => {
   let attempts = 0;
   const controller = createDocumentUploadController({
+    createSession,
     uploadDocument: async () => {
       attempts += 1;
       if (attempts === 1) throw new ApiError('Upload failed safely.', { code: 'http_error', status: 503, retryable: true });
-      return { id: 'confirmed-after-retry' };
+      return { document_id: 'confirmed-after-retry' };
     },
   });
   controller.select(validFile);
@@ -64,7 +97,7 @@ test('supports retry after a recoverable server failure', async () => {
   await controller.retry();
   assert.equal(attempts, 2);
   assert.equal(controller.getState().status, 'uploaded');
-  assert.equal(controller.getState().uploadedDocument.id, 'confirmed-after-retry');
+  assert.equal(controller.getState().uploadedDocument.document_id, 'confirmed-after-retry');
 });
 
 test('retains unsupported-file errors without treating the file as selected or uploaded', () => {
@@ -88,7 +121,8 @@ test('explains that upload is unavailable when no contract-specific uploader is 
 
 test('cancels upload and clears selected and server-confirmed state on reset', async () => {
   const controller = createDocumentUploadController({
-    uploadDocument: (_file, { signal }) => new Promise((_resolve, reject) => {
+    createSession,
+    uploadDocument: (_sessionId, _file, { signal }) => new Promise((_resolve, reject) => {
       const rejectAbort = () => reject(new DOMException('Aborted', 'AbortError'));
       if (signal.aborted) rejectAbort();
       else signal.addEventListener('abort', rejectAbort, { once: true });
@@ -109,8 +143,9 @@ test('cancels upload and clears selected and server-confirmed state on reset', a
 
 test('turns timeout into a retryable upload error without claiming success', async () => {
   const controller = createDocumentUploadController({
+    createSession,
     timeoutMs: 5,
-    uploadDocument: (_file, { signal }) => new Promise((_resolve, reject) => {
+    uploadDocument: (_sessionId, _file, { signal }) => new Promise((_resolve, reject) => {
       signal.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true });
     }),
   });

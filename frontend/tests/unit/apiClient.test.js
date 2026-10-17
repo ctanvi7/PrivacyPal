@@ -96,5 +96,6 @@ test('does not allow requests to escape the configured origin', async () => {
   const client = createApiClient({ fetchImpl: async () => new Response('unexpected') });
   assert.equal(DEFAULT_API_BASE_URL, 'http://127.0.0.1:8000');
   await assert.rejects(client.request('https://example.com/private'), TypeError);
-  assert.equal(WORKFLOW_API_CONTRACT.implemented, false);
+  assert.equal(WORKFLOW_API_CONTRACT.implemented, true);
+  assert.deepEqual(WORKFLOW_API_CONTRACT.pending, ['draft editing', 'acknowledgement', 'approval and answer delivery']);
 });

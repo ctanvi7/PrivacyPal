@@ -9,7 +9,28 @@ const STATUS_LABELS = {
   'send-error': 'Submission failed. Review the final text before trying again.',
 };
 
-export default function PrivacyReviewPanel({ state, controller }) {
+function BackendAnalysis({ response }) {
+  const residual = response.residual_review;
+  const residualFindings = Array.isArray(residual.findings) ? residual.findings : [];
+  return <section className="review-card glass-panel" aria-labelledby="backend-review-title">
+    <div className="review-top"><span className="review-lock" aria-hidden="true">✓</span><div className="review-title"><h2 id="backend-review-title">Local privacy review</h2><p>{response.review_complete ? 'The backend returned this local review. Nothing has been sent to an answer provider.' : 'The backend returned an incomplete review. Nothing has been sent to an answer provider.'}</p></div></div>
+    <section aria-labelledby="backend-question-title"><h3 id="backend-question-title">Your question</h3><p>{response.question}</p></section>
+    <section aria-labelledby="backend-draft-title"><h3 id="backend-draft-title">Proposed request · not sent</h3><pre className="request-preview">{response.draft}</pre></section>
+    <section aria-labelledby="backend-findings-title"><h3 id="backend-findings-title">Privacy findings returned by the backend</h3>
+      {response.findings.length ? <ul>{response.findings.map((finding, index) => <li key={finding.finding_id || index}>
+        <strong>{finding.category || 'Finding'}</strong>{finding.action && <> · {finding.action}</>}{finding.reason && <p>{finding.reason}</p>}
+      </li>)}</ul> : <p>The backend returned no findings.</p>}
+    </section>
+    <section aria-labelledby="backend-residual-title"><h3 id="backend-residual-title">Remaining review</h3><p>Status returned: {residual.status || 'unspecified'}</p>
+      {residualFindings.length > 0 && <ul>{residualFindings.map((finding, index) => <li key={finding.finding_id || index}>{finding.category || 'Finding'}{finding.action && <> · {finding.action}</>}{finding.reason && <p>{finding.reason}</p>}</li>)}</ul>}
+      {Array.isArray(residual.reasons) && residual.reasons.length > 0 && <ul>{residual.reasons.map((reason, index) => <li key={index}>{reason}</li>)}</ul>}
+    </section>
+    <p className="review-footnote">Workflow {response.workflow_id} · version {response.version} · pages used: {response.pages_used.length ? response.pages_used.join(', ') : 'none reported'} · state: {response.send_state} · acknowledged: {response.acknowledged ? 'yes' : 'no'} · provider: {response.provider.name || 'not supplied'} ({response.provider.configured ? 'configured' : 'not configured'})</p>
+  </section>;
+}
+
+export default function PrivacyReviewPanel({ state, controller, workflowResponse }) {
+  if (workflowResponse) return <BackendAnalysis response={workflowResponse}/>;
   const review = state.review;
   if (!review || review.source !== 'backend') return null;
   const editing = state.status === 'editing';

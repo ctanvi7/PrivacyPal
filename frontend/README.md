@@ -1,6 +1,6 @@
 # PrivacyPal frontend
 
-Run the current React frontend from PowerShell:
+Run the React + Vite frontend from PowerShell:
 
 ```powershell
 cd frontend
@@ -8,43 +8,30 @@ npm.cmd install
 npm.cmd run dev
 ```
 
-The initial screen is a genuine empty chat. Select **Rent affordability** in the sidebar to open the clearly labeled illustrative preview. The preview uses synthetic values only; its edit and approval controls do not send data. Selecting a file keeps it in the browser and shows a pending state.
+The empty chat supports selecting a document, uploading it to the local backend, and asking a question after the backend confirms the upload. The sidebar's Rent affordability conversation is illustrative sample data only; its content is never sent to the backend.
 
-## Backend integration status
+## Backend integration
 
-The `backend/app` directories currently contain placeholders only. There is no implemented API, so the frontend cannot upload or analyze documents, prepare a real privacy review, or request an answer. The API route outline in the root `ARCHITECTURE.md` is a design contract, not a running service or a complete request/response schema. The current UI therefore keeps file selection local and question submission fail-closed with a connection-pending message. Sample conversation data remains explicitly illustrative.
+`src/lib/privacyPalApi.js` connects only the implemented backend calls:
 
-## API transport and workflow model
+- `POST /api/v1/sessions`
+- `POST /api/v1/sessions/{session_id}/documents` with one multipart `file` part
+- `POST /api/v1/sessions/{session_id}/questions` with `{ document_id, question }`
 
-`src/lib/apiClient.js` provides a transport-only Fetch client with JSON and text response handling, safe HTTP/network error messages, cancellation, and a configurable timeout. It does not define or call upload, analysis, review, edit, approval, or answer routes. Its default base URL is `http://127.0.0.1:8000`; set `VITE_PRIVACYPAL_API_BASE_URL` in the Vite environment to use another local backend URL. Vite environment values are included at build time, so this variable must contain only a non-secret API URL. The UI does not call this transport until the backend contract is confirmed.
+The browser creates a runtime session before upload. The document is marked uploaded only after the response includes a document ID. Question analysis requires that confirmed document and passes through the actual workflow response. The privacy panel shows the backend's proposed draft, findings, residual review, and metadata as read-only. This question route runs local privacy analysis; it does not send an external answer request.
 
-`src/lib/workflow.js` defines the frontend workflow transitions and recoverable upload, processing, approval, and network error states. At present the UI uses it to track validated document selection; later processing states are modelled and tested but are not presented as completed backend work.
+The API base URL can be set with `VITE_PRIVACYPAL_API_BASE_URL` in the Vite environment. The default is `http://127.0.0.1:8000`, verified against `backend/app/config.py` (`APP_HOST`/`APP_PORT` defaults) and `LOCAL_SETUP.md`. Vite variables are public build-time configuration; set only a URL, never credentials. The backend CORS origin defaults to `http://127.0.0.1:5173` (`FRONTEND_ORIGIN`). If those backend settings are changed, configure the frontend URL and allowed origin to match.
 
-`src/lib/documentUploadController.js` owns local selected-file state separately from `uploadedDocument`, which is populated only when an injected uploader resolves after server confirmation. It handles validation, duplicate-submit prevention, cancellation, timeout, retry, reset, and safe errors. The UI currently uses its selection/reset behavior only. There is intentionally no uploader configured, so the app does not send the file or show a false upload success. When the backend contract is ready, implement a small contract-specific `uploadDocument(file, { signal })` adapter and inject it into this controller; do not add route or multipart assumptions to the controller itself. Progress is not shown because no confirmed progress contract exists.
-
-`src/lib/questionController.js` requires a server-confirmed `uploadedDocument` before it invokes an injected analysis function. It validates empty questions, blocks duplicate in-flight submissions, and tracks processing, cancellation, unavailable, and recoverable error states. The UI has no analysis callback configured, so selected local files cannot trigger real analysis.
-
-`src/lib/privacyReview.js` documents the canonical review model and requires an explicit adapter from the eventual backend schema. The adapter maps original request text, proposed and exact outgoing text, keep/mask/replace recommendations with reasons, and opaque backend-supplied risk flags. A caller must explicitly identify the input as backend-originated; the illustrative sidebar conversation does not pass through this path. `src/components/PrivacyReviewPanel.jsx` presents only a normalized backend review, displays the exact editable outgoing text, and keeps approval separate from editing. The controller requires a separate explicit approval action before calling an injected sender, suppresses duplicate sends, and returns failures to editing without automatically retrying. No review adapter or approval sender is currently configured; the send button stays disabled.
+Transport errors use backend safe `{ error: { code, message, retryable } }` responses when the message passes a safety check; otherwise a user-safe status message is shown. Network errors, cancellation, timeout, retry, and duplicate-submit states are handled by the shared API client/controllers. Upload progress is shown as an uploading state because the browser Fetch API used here does not report upload progress.
 
 ## Tests
-
-Run the dependency-free frontend unit tests with:
 
 ```powershell
 cd frontend
 npm.cmd test
+npm.cmd run build
 ```
 
-## Backend contract needed to enable workflow calls
+## Next integration milestone
 
-Before connecting real workflow requests, document and implement:
-
-- Session creation, session cookie and CSRF behavior, expiry, and clear semantics.
-- Upload field names, accepted content, size/page limits, and response schema.
-- Question submission payload, processing status/polling behavior, and response schema.
-- Review finding fields, keep/mask/replace decisions, reasons, risk flags, and the exact proposed outbound request.
-- Request edit payload and the revalidation/version behavior after edits.
-- Approval payload and server-side approval conditions, plus final answer and citation/reference schema.
-- Structured error codes, safe user-facing messages, retryability, and CORS/allowed-origin configuration.
-
-The route outline in the root `ARCHITECTURE.md` is a guide for those contracts, not evidence that any route is currently available.
+The backend also currently implements workflow draft editing, acknowledgement, approval, and answer delivery routes. Those are intentionally not connected by this prompt. They need a separate integration step and tests before the UI offers those operations. The root `docs/API_CONTRACT.md` is still labeled a draft and contains older route examples; use the actual route implementations in `backend/app/main.py` as the source of truth.
