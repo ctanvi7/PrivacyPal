@@ -26,7 +26,7 @@ test('reflects processing and the real local-review response without implying ap
 
   const review = getPrivacyProgress({ uploadStatus: 'uploaded', questionStatus: 'review-ready', workflowResponse: completeReview });
   assert.deepEqual(review.map(stage => stage.status), ['completed', 'completed', 'in-progress', 'pending']);
-  assert.match(review[2].detail, /approval is not connected/i);
+  assert.match(review[2].detail, /approve explicitly before sending/i);
   assert.match(review[3].detail, /no answer has been returned/i);
 });
 

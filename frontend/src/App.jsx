@@ -1,10 +1,11 @@
 import { useEffect, useId, useReducer, useRef, useState } from 'react';
 import { createDocumentUploadController } from './lib/documentUploadController.js';
 import { createQuestionController } from './lib/questionController.js';
-import { createPrivacyReviewController } from './lib/privacyReview.js';
+import { adaptBackendWorkflow, createPrivacyReviewController } from './lib/privacyReview.js';
 import { privacyPalApi } from './lib/privacyPalApi.js';
 import { getPrivacyProgress } from './lib/privacyProgress.js';
 import { createInitialWorkflowState, workflowReducer } from './lib/workflow.js';
+import { createConversationHistoryController, groupConversationsByLocalDate } from './lib/conversationHistory.js';
 import PrivacyReviewPanel from './components/PrivacyReviewPanel.jsx';
 
 const SAMPLE_REQUEST = 'Monthly take-home pay: ₹72,000\nPlanned rent: ₹28,000 per month\nQuestion: Is this rent affordable as a share of monthly income?';
@@ -64,9 +65,9 @@ function FileChip({ file, sample = false, uploaded = false, onRemove }) {
   return <div className="file-chip"><span className="file-icon">PDF</span><span className="file-name"><strong title={name}>{name}</strong><small>{size}</small></span>{sample ? <span className="sample-x" aria-hidden="true"><Icon name="close" size={18}/></span> : <button type="button" className="icon-button" aria-label="Remove selected document" onClick={onRemove}><Icon name="close" size={18}/></button>}</div>;
 }
 
-function ReviewTimeline({ mode, uploadStatus, questionStatus, workflowResponse }) {
+function ReviewTimeline({ mode, uploadStatus, questionStatus, workflowResponse, reviewStatus, answerReturned }) {
   const sample = mode === 'preview';
-  const steps = getPrivacyProgress({ uploadStatus, questionStatus, workflowResponse, illustrativePreview: sample });
+  const steps = getPrivacyProgress({ uploadStatus, questionStatus, workflowResponse, reviewStatus, answerReturned, illustrativePreview: sample });
   const symbols = { completed: <Icon name="check" size={16}/>, failed: <Icon name="close" size={15}/> };
   return <div className={`review-steps ${sample ? 'is-sample' : ''}`} aria-label={sample ? 'Illustrative workflow progress' : 'Privacy workflow progress'}>{steps.map((step, index) => <div className="timeline-item" data-status={step.status} key={step.id}>
     <span className={`step-number ${step.status}`} data-status={step.status} role="img" aria-label={`${step.title}: ${step.status}`} title={step.status}>{symbols[step.status] || index + 1}</span>
@@ -78,30 +79,77 @@ function EmptyConversation({ onChoose }) {
   return <div className="empty-state"><div className="empty-shield"><ShieldEmblem size={36}/></div><h2>What would you like to understand?</h2><p>Choose a document, then ask a question. You’ll review what may be shared before anything is sent to an AI provider.</p><button className="upload-cta" type="button" onClick={onChoose}><Icon name="attach" size={19}/>Choose a document</button><span className="supported">PDF, PNG, JPEG, or WebP</span><div className="empty-reassurance"><ShieldMark/><p>Your original document stays on this device. Any approved request sent to an external provider will be shown for review first.</p></div></div>;
 }
 
+function SavedMessages({ messages, answerResult = null }) {
+  const answerIndex = answerResult?.answer ? messages.map(message => message.role === 'assistant' && message.content === answerResult.answer).lastIndexOf(true) : -1;
+  return messages.map((message, index) => <div className={message.role === 'user' ? 'user-row' : 'assistant-row'} key={message.message_id}>
+    {message.role === 'assistant' && <ShieldMark className="assistant-avatar"/>}
+    <div className={message.role === 'user' ? 'user-message history-message' : 'assistant-message history-message'}><p>{message.content}</p>{index === answerIndex && answerResult.pages_used?.length > 0 && <p className="answer-citation">Source pages: {answerResult.pages_used.join(', ')}</p>}<time>{new Date(message.created_at).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}</time></div>
+  </div>);
+}
+
 function App() {
   const fileInput = useRef(null);
+  const [historyController] = useState(() => createConversationHistoryController({ api: privacyPalApi }));
+  const [historyState, setHistoryState] = useState(historyController.getState);
   const [uploadController] = useState(() => createDocumentUploadController({
     createSession: options => privacyPalApi.createSession(options),
+    getConversationId: () => historyController.getState().selectedId,
     uploadDocument: (sessionId, selectedFile, options) => privacyPalApi.uploadDocument(sessionId, selectedFile, options),
   }));
   const [uploadState, setUploadState] = useState(uploadController.getState);
+  const uploadStateRef = useRef(uploadState);
+  uploadStateRef.current = uploadState;
   const [questionController] = useState(() => createQuestionController({ timeoutMs: 135_000,
     submitQuestion: (text, document, { signal, session }) => privacyPalApi.submitQuestion(session.session_id, document.document_id, text, { signal }),
   }));
   const [questionState, setQuestionState] = useState(questionController.getState);
-  const [reviewController] = useState(() => createPrivacyReviewController());
+  const [reviewController] = useState(() => createPrivacyReviewController({
+    adaptBackendReview: adaptBackendWorkflow,
+    updateDraft: ({ workflowId, version, draft }, options) => {
+      const sessionId = uploadStateRef.current.session?.session_id;
+      return privacyPalApi.updateDraft(sessionId, workflowId, version, draft, options);
+    },
+    acknowledgeReview: ({ workflowId, version }, options) => {
+      const sessionId = uploadStateRef.current.session?.session_id;
+      return privacyPalApi.acknowledgeReview(sessionId, workflowId, version, options);
+    },
+    sendApprovedRequest: ({ workflowId, version }, options) => {
+      const sessionId = uploadStateRef.current.session?.session_id;
+      return privacyPalApi.approveWorkflow(sessionId, workflowId, version, options);
+    },
+  }));
   const [reviewState, setReviewState] = useState(reviewController.getState);
+  const handledAnswerRef = useRef(null);
   const [workflow, dispatchWorkflow] = useReducer(workflowReducer, undefined, createInitialWorkflowState);
   const [mode, setMode] = useState('empty');
   const [question, setQuestion] = useState('');
   const [draft, setDraft] = useState(SAMPLE_REQUEST);
   const [editing, setEditing] = useState(false);
   const [notice, setNotice] = useState('');
+  const [mobileHistoryOpen, setMobileHistoryOpen] = useState(false);
+  const [mobilePrivacyOpen, setMobilePrivacyOpen] = useState(false);
   const file = uploadState.selectedFile;
 
   useEffect(() => uploadController.subscribe(setUploadState), [uploadController]);
   useEffect(() => questionController.subscribe(setQuestionState), [questionController]);
   useEffect(() => reviewController.subscribe(setReviewState), [reviewController]);
+  useEffect(() => historyController.subscribe(setHistoryState), [historyController]);
+  useEffect(() => { void historyController.load(); }, [historyController]);
+  useEffect(() => {
+    if (mobilePrivacyOpen) document.getElementById('privacy-panel')?.scrollIntoView({ behavior: 'auto', block: 'start' });
+  }, [mobilePrivacyOpen]);
+  useEffect(() => {
+    const result = reviewState.result;
+    if (reviewState.status !== 'sent' || !result || handledAnswerRef.current === result.workflow_id) return;
+    handledAnswerRef.current = result.workflow_id;
+    const conversationId = uploadState.session?.conversation_id || historyState.selectedId;
+    void historyController.refreshAfterAnswer(conversationId, result);
+    if (result.history_saved) {
+      setNotice('Answer returned and saved to this conversation.');
+    } else {
+      setNotice('Answer returned, but local conversation history could not save this exchange. It will not appear in saved history.');
+    }
+  }, [reviewState.result, reviewState.status, uploadState.session, historyState.selectedId, historyController]);
 
   useEffect(() => {
     function handleShortcut(event) {
@@ -114,9 +162,11 @@ function App() {
     return () => window.removeEventListener('keydown', handleShortcut);
   }, []);
 
-  function openPreview() { uploadController.reset(); questionController.reset(); reviewController.reset(); dispatchWorkflow({ type: 'RESET' }); setMode('preview'); setQuestion(''); setEditing(false); setDraft(SAMPLE_REQUEST); setNotice('This conversation contains illustrative sample data only.'); if (fileInput.current) fileInput.current.value = ''; }
+  function openPreview() { historyController.clearSelection(); uploadController.reset(); questionController.reset(); reviewController.reset(); dispatchWorkflow({ type: 'RESET' }); setMode('preview'); setQuestion(''); setEditing(false); setDraft(SAMPLE_REQUEST); setNotice('This conversation contains illustrative sample data only.'); if (fileInput.current) fileInput.current.value = ''; }
 
-  function startNewChat() {
+  async function startNewChat() {
+    if (historyController.getState().creating) return;
+    setMobileHistoryOpen(false);
     uploadController.reset();
     questionController.reset();
     reviewController.reset();
@@ -125,12 +175,53 @@ function App() {
     setDraft(SAMPLE_REQUEST);
     setEditing(false);
     setQuestion('');
+    historyController.clearSelection();
+    setNotice('Creating a new conversation…');
+    if (fileInput.current) fileInput.current.value = '';
+    try {
+      await historyController.create();
+      setNotice('New conversation ready. Choose a document to begin.');
+    } catch {
+      setNotice(historyController.getState().error || 'A new conversation could not be created. Try again.');
+    }
+  }
+
+  async function selectConversation(conversationId) {
+    setMobileHistoryOpen(false);
+    uploadController.reset();
+    questionController.reset();
+    reviewController.reset();
+    dispatchWorkflow({ type: 'RESET' });
+    setQuestion('');
+    setMode('history');
     setNotice('');
     if (fileInput.current) fileInput.current.value = '';
+    await historyController.open(conversationId);
+  }
+
+  async function deleteConversation(conversationId) {
+    if (!window.confirm('Delete this saved conversation and its messages? This cannot be undone.')) return;
+    const selectedAtDelete = historyController.getState().selectedId === conversationId;
+    const deleted = await historyController.remove(conversationId);
+    if (deleted && selectedAtDelete && historyController.getState().selectedId === null) {
+      uploadController.reset(); questionController.reset(); reviewController.reset();
+      dispatchWorkflow({ type: 'RESET' }); setQuestion(''); setMode('empty');
+      setNotice('Saved conversation deleted.');
+    }
   }
 
   async function selectDocument(candidate) {
     if (!candidate) return;
+    let targetConversationId = historyController.getState().selectedId;
+    if (!targetConversationId) {
+      try { targetConversationId = (await historyController.create()).conversation_id; }
+      catch { setNotice(historyController.getState().error || 'A conversation could not be created. The document was not uploaded.'); if (fileInput.current) fileInput.current.value = ''; return; }
+    }
+    if (historyController.getState().selectedId !== targetConversationId) {
+      setNotice('Conversation selection changed. Choose the document again in the active conversation.');
+      if (fileInput.current) fileInput.current.value = '';
+      return;
+    }
     const selected = uploadController.select(candidate);
     if (selected.error?.code === 'unsupported_file') {
       setNotice(selected.error.message);
@@ -166,27 +257,58 @@ function App() {
   async function submitQuestion(event) {
     event.preventDefault();
     if (mode === 'preview') { setNotice('This is a demo conversation. Questions and requests in the preview are not sent.'); return; }
+    reviewController.reset();
     await questionController.submit({ question, uploadedDocument: uploadState.uploadedDocument, session: uploadState.session, uploadedSessionId: uploadState.uploadedSessionId });
     const submission = questionController.getState();
-    if (submission.error) setNotice(submission.error.message);
-    else if (submission.status === 'review-ready') setNotice('Local privacy analysis returned. Review the backend-provided request below; nothing has been sent to an answer provider.');
+    if (submission.result) {
+      reviewController.load(submission.result, { source: 'backend' });
+      setNotice('Local privacy analysis returned. Review the exact backend-provided request below; no answer request has been sent.');
+    } else if (submission.error) setNotice(submission.error.message);
   }
 
   async function retryQuestion() {
     await questionController.retry({ uploadedDocument: uploadState.uploadedDocument, session: uploadState.session, uploadedSessionId: uploadState.uploadedSessionId });
     const submission = questionController.getState();
+    if (submission.result) reviewController.load(submission.result, { source: 'backend' });
     setNotice(submission.error?.message || 'Question processing completed.');
   }
 
+  async function restartReview() {
+    reviewController.reset();
+    questionController.setQuestion(question);
+    await questionController.submit({ question, uploadedDocument: uploadState.uploadedDocument, session: uploadState.session, uploadedSessionId: uploadState.uploadedSessionId });
+    const submission = questionController.getState();
+    if (submission.result) reviewController.load(submission.result, { source: 'backend' });
+    setNotice(submission.error?.message || 'A fresh local review is ready.');
+  }
+
   const hasPreview = mode === 'preview';
+  const historyGroups = groupConversationsByLocalDate(historyState.items);
+  const conversationGroups = [
+    ['Today', historyGroups.today],
+    ['Previous 7 days', historyGroups.previous7Days],
+    ['Older', historyGroups.older],
+  ];
 
   return <main className="workspace" data-workflow-state={workflow.status} data-upload-state={uploadState.status} data-question-state={questionState.status}>
-    <aside className="sidebar glass-panel" aria-label="Conversation navigation">
+    <aside id="conversation-sidebar" className={`sidebar glass-panel ${mobileHistoryOpen ? 'mobile-open' : ''}`} aria-label="Conversation navigation">
       <a className="brand" href="#home" onClick={event => { event.preventDefault(); startNewChat(); }} aria-label="PrivacyPal home"><span className="brand-mark"><PrivacyPalLogo size={40}/></span><span><strong>PrivacyPal</strong><small>Privacy in your control.</small></span></a>
       <button className="new-chat" type="button" onClick={startNewChat}><span className="plus-disc"><Icon name="plus" size={20}/></span><b>New chat</b><kbd>Ctrl N</kbd></button>
       <nav className="recent-list" aria-label="Conversation navigation">
-        <p className="nav-label">Today</p><p className="recent-empty">No saved conversations</p>
-        <p className="nav-label previous-label">Previous 7 days</p><p className="recent-empty">No saved conversations</p>
+        {historyState.status === 'loading' && <p className="recent-empty" role="status">Loading saved conversations…</p>}
+        {historyState.status === 'error' && <div className="recent-empty" role="alert">{historyState.error} <button type="button" onClick={() => void historyController.refresh()}>Retry</button></div>}
+        {historyState.status === 'ready' && historyState.error && <p className="recent-empty" role="alert">{historyState.error}</p>}
+        {historyState.status === 'ready' && historyState.items.length === 0 && <p className="recent-empty">No saved conversations</p>}
+        {conversationGroups.map(([label, items]) => items.length > 0 && <section key={label} aria-label={label}>
+          <p className={`nav-label ${label === 'Previous 7 days' ? 'previous-label' : ''}`}>{label}</p>
+          {items.map(item => <div className="history-row" key={item.conversation_id}>
+            <button className={`recent ${historyState.selectedId === item.conversation_id ? 'active' : ''}`} type="button" onClick={() => void selectConversation(item.conversation_id)} aria-current={historyState.selectedId === item.conversation_id ? 'page' : undefined}>
+              <Icon name="chat" size={18}/><span>{item.preview || 'New conversation'}<small>{new Date(item.updated_at).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}</small></span>
+            </button>
+            <button className="history-delete" type="button" aria-label={`Delete conversation ${item.preview || 'without a title'}`} disabled={historyState.deletingId === item.conversation_id} onClick={() => void deleteConversation(item.conversation_id)}><Icon name="close" size={16}/></button>
+          </div>)}
+        </section>)}
+        {historyState.status === 'ready' && historyState.hasMore && <button className="history-more" type="button" onClick={() => void historyController.loadMore()}>Load more</button>}
         <p className="nav-label preview-label">Illustrative preview</p>
         <button className={`recent ${hasPreview ? 'active' : ''}`} type="button" onClick={openPreview}><Icon name="chat" size={18}/><span>Rent affordability <small className="recent-sample">Demo content · not saved</small></span></button>
       </nav>
@@ -195,14 +317,28 @@ function App() {
     </aside>
 
     <section className="chat-column" aria-label="Private chat">
-      <header className="chat-header"><div><div className="title-row"><h1>Private chat</h1><span className="local-badge"><Icon name="monitor" size={18}/>Local analysis</span></div><p>Get helpful answers from AI, with your privacy in control.</p><span className={`connection-label ${hasPreview ? 'sample' : ''}`}>{hasPreview ? 'Illustrative preview · demo data only' : uploadState.status === 'uploaded' ? 'Local backend connected · document ready' : 'Local backend integration enabled'}</span></div><button className="mobile-privacy" type="button" onClick={() => document.getElementById('privacy-panel')?.scrollIntoView({ behavior: 'smooth' })}>Privacy details</button></header>
+      <header className="chat-header"><div><div className="title-row"><h1>Private chat</h1><span className="local-badge"><Icon name="monitor" size={18}/>Local analysis</span></div><p>Get helpful answers from AI, with your privacy in control.</p><span className={`connection-label ${hasPreview ? 'sample' : ''}`}>{hasPreview ? 'Illustrative preview · demo data only' : uploadState.status === 'uploaded' ? 'Local backend connected · document ready' : 'Local backend integration enabled'}</span></div><div className="mobile-header-actions"><button className="mobile-history" type="button" aria-controls="conversation-sidebar" aria-expanded={mobileHistoryOpen} onClick={() => setMobileHistoryOpen(open => !open)}>{mobileHistoryOpen ? 'Hide history' : 'History'}</button><button className="mobile-privacy" type="button" aria-controls="privacy-panel" aria-expanded={mobilePrivacyOpen} onClick={() => setMobilePrivacyOpen(open => !open)}>{mobilePrivacyOpen ? 'Hide privacy details' : 'Privacy details'}</button></div></header>
 
       <div className={`conversation ${hasPreview ? 'sample-conversation' : 'empty-conversation'}`} aria-live="polite">
         {hasPreview ? <>
           <div className="user-row"><div className="user-message"><p>Can I afford ₹28,000/month rent based on this payslip?</p><FileChip sample/><time>10:24 AM</time></div><span className="user-avatar" aria-label="Sample user"><span/></span></div>
           <div className="assistant-row"><ShieldMark className="assistant-avatar"/><div className="assistant-message"><p>Illustrative assistant response · no document was analyzed.</p><p>Review this example request to preview the approval interface.</p><time>10:24 AM</time></div></div>
           <section className="review-card glass-panel" aria-labelledby="review-title"><div className="review-top"><span className="review-lock"><Icon name="lock" size={28}/></span><div className="review-title"><h2 id="review-title">Review before sending</h2><p>Illustrative cleaned-request preview.</p></div><span className="risk-pill"><i/>LOW RISK · SAMPLE</span></div><label className="visually-hidden" htmlFor="sanitized-request">Illustrative cleaned request</label><textarea id="sanitized-request" className="request-preview" readOnly={!editing} value={draft} onChange={event => { setDraft(event.target.value); if (notice) setNotice(''); }}/><div className="review-actions"><button className="approve-button" type="button" onClick={() => setNotice('Demo only: no request was sent. Connect the backend to enable reviewed approval.')}><Icon name="send" size={19}/>Approve &amp; get answer</button><button className="edit-button" type="button" onClick={() => { setEditing(!editing); setNotice(editing ? 'Sample preview restored.' : 'Edit the example request. Demo changes are not sent.'); }}><Icon name="edit" size={19}/>{editing ? 'Done editing' : 'Edit request'}</button></div><p className="review-footnote"><span className="info-icon">i</span>Example text only <b>·</b> nothing can be sent from this preview</p></section>
-        </> : file ? <><div className="user-row"><div className="user-message"><p>{uploadState.status === 'uploaded' ? 'Document uploaded' : uploadState.status === 'uploading' ? 'Uploading document' : 'Document selected'}</p><FileChip file={file} uploaded={uploadState.status === 'uploaded'} onRemove={removeDocument}/></div></div>{questionState.result ? <PrivacyReviewPanel workflowResponse={questionState.result}/> : <div className="pending-card glass-panel"><span className="pending-icon"><Icon name="lock" size={22}/></span><div><h2>{uploadState.status === 'uploading' ? 'Uploading to local service' : uploadState.status === 'upload-error' || uploadState.status === 'cancelled' ? 'Upload needs attention' : 'Ready for your question'}</h2><p>{uploadState.status === 'uploading' ? 'Creating a session and processing the selected file. Please wait.' : uploadState.status === 'uploaded' ? 'The local service confirmed this document. Ask a question to run local privacy analysis; this step does not send anything to an answer provider.' : uploadState.error?.message || 'The selected file remains local until the service confirms a successful upload.'}</p>{uploadState.status === 'uploading' && <button className="edit-button" type="button" onClick={() => uploadController.cancel()}>Cancel upload</button>}{uploadState.error?.retryable && <button className="edit-button" type="button" onClick={() => uploadController.retry()}>Retry upload</button>}</div></div>}</> : <EmptyConversation onChoose={() => fileInput.current?.click()}/>}
+        </> : mode === 'history' ? <>
+          {historyState.detailStatus === 'loading' && <p className="notice" role="status">Loading saved conversation…</p>}
+          {historyState.detailStatus === 'error' && <div className="pending-card glass-panel" role="alert"><div><h2>Conversation unavailable</h2><p>{historyState.detailError}</p><button className="edit-button" type="button" onClick={() => void historyController.open(historyState.selectedId)}>Retry loading</button></div></div>}
+          {historyState.detailStatus === 'ready' && historyState.detail?.messages.length === 0 && <div className="pending-card glass-panel"><div><h2>No saved messages yet</h2><p>This conversation is ready. Choose a document to start a new exchange.</p></div></div>}
+          {historyState.detailStatus === 'ready' && historyState.detail?.messages && <SavedMessages messages={historyState.detail.messages}/>}
+        </> : file ? <>
+          {historyState.detailStatus === 'ready' && historyState.detail?.conversation_id === uploadState.session?.conversation_id && !(reviewState.status === 'sent' && reviewState.result?.history_saved) && <SavedMessages messages={historyState.detail.messages}/>}
+          <div className="user-row"><div className="user-message"><p>{uploadState.status === 'uploaded' ? 'Document uploaded' : uploadState.status === 'uploading' ? 'Uploading document' : 'Document selected'}</p><FileChip file={file} uploaded={uploadState.status === 'uploaded'} onRemove={removeDocument}/></div></div>
+          {reviewState.status === 'sent' && reviewState.result?.history_saved ? <SavedMessages messages={historyState.detail?.messages || []} answerResult={reviewState.result}/> : <>
+            {questionState.question && <div className="user-row"><div className="user-message"><p>{questionState.question}</p></div></div>}
+            {questionState.result ? <PrivacyReviewPanel state={reviewState} controller={reviewController} onRestart={restartReview}/> : <div className="pending-card glass-panel"><span className="pending-icon"><Icon name="lock" size={22}/></span><div><h2>{uploadState.status === 'uploading' ? 'Uploading to local service' : uploadState.status === 'upload-error' || uploadState.status === 'cancelled' ? 'Upload needs attention' : 'Ready for your question'}</h2><p>{uploadState.status === 'uploading' ? 'Creating a session and processing the selected file. Please wait.' : uploadState.status === 'uploaded' ? 'The local service confirmed this document. Ask a question to run local privacy analysis; this step does not send anything to an answer provider.' : uploadState.error?.message || 'The selected file remains local until the service confirms a successful upload.'}</p>{uploadState.status === 'uploading' && <button className="edit-button" type="button" onClick={() => uploadController.cancel()}>Cancel upload</button>}{uploadState.error?.retryable && <button className="edit-button" type="button" onClick={() => uploadController.retry()}>Retry upload</button>}</div></div>}
+            {reviewState.result?.answer && <div className="assistant-row"><ShieldMark className="assistant-avatar"/><div className="assistant-message"><p>{reviewState.result.answer}</p>{reviewState.result.pages_used?.length > 0 && <p className="answer-citation">Source pages: {reviewState.result.pages_used.join(', ')}</p>}<time>Answer returned by the backend</time></div></div>}
+          </>}
+        </> : <EmptyConversation onChoose={() => fileInput.current?.click()}/>}
+
         {questionState.status === 'processing' && <div className="notice" role="status">Question processing is in progress. <button type="button" onClick={() => { questionController.cancel(); setNotice('Question submission cancelled.'); }}>Cancel</button></div>}
         {questionState.status === 'processing-error' && questionState.error?.retryable && uploadState.uploadedDocument && <div className="notice" role="status">{questionState.error.message} <button type="button" onClick={retryQuestion}>Retry question</button></div>}
         {notice && <p className="notice" role="status">{notice}</p>}
@@ -211,11 +347,11 @@ function App() {
       <form className="composer glass-panel" onSubmit={submitQuestion}><input ref={fileInput} className="visually-hidden" type="file" accept="application/pdf,image/png,image/jpeg,image/webp" aria-label="Choose a PDF or image document" onChange={event => selectDocument(event.target.files?.[0])}/><button className="attach-button" type="button" aria-label="Attach a document" onClick={() => fileInput.current?.click()} disabled={uploadState.status === 'uploading' || questionState.status === 'processing'}><Icon name="attach" size={20}/></button><label className="visually-hidden" htmlFor="question">Ask a question about your document</label><textarea id="question" value={question} onChange={event => { setQuestion(event.target.value); questionController.setQuestion(event.target.value); if (notice) setNotice(''); }} placeholder={hasPreview ? 'Ask a follow-up about this sample?' : file ? 'Ask a question about this document?' : 'Choose a document to start a private chat…'} rows="1" disabled={questionState.status === 'processing' || uploadState.status === 'uploading'}/><button className="send-button" type="submit" aria-label="Submit question" disabled={questionState.status === 'processing' || uploadState.status !== 'uploaded' || !question.trim()}><Icon name="send" size={19}/></button></form>
     </section>
 
-    <aside id="privacy-panel" className="privacy-panel glass-panel" aria-label="Privacy review status">
+    <aside id="privacy-panel" className={`privacy-panel glass-panel ${mobilePrivacyOpen ? 'mobile-open' : ''}`} aria-label="Privacy review status">
       <div className="privacy-heading"><span className="privacy-icon"><PrivacyPalLogo size={34}/></span><div><h2>Privacy check</h2><p>{hasPreview ? 'Illustrative sample results · not an actual analysis.' : 'Local privacy checks will appear here after backend analysis.'}</p></div></div>
       <div className="summary-grid"><div className="summary-card"><span className="summary-symbol warning"><Icon name="eyeOff" size={19}/></span><div><strong>{hasPreview ? '3' : questionState.result ? questionState.result.findings.length : '—'}</strong><p>{hasPreview ? 'details removed' : 'findings returned'}</p></div><small>{hasPreview ? 'Sample: name, PAN, account no.' : questionState.result ? 'Backend response' : 'No analysis performed'}</small></div><div className="summary-card"><span className="summary-symbol violet"><Icon name="file" size={18}/></span><div><strong>{hasPreview ? '2' : questionState.result ? questionState.result.pages_used.length : '—'}</strong><p>{hasPreview ? 'useful facts kept' : 'pages used'}</p></div><small>{hasPreview ? 'Illustrative sample' : questionState.result ? 'Backend response' : 'No analysis performed'}</small></div></div>
-      <ReviewTimeline mode={mode} uploadStatus={uploadState.status} questionStatus={questionState.status} workflowResponse={questionState.result}/>
-      <div className="control-note"><span className="note-lock"><Icon name="lock" size={24}/></span><div><strong>You’re in control</strong><p>{hasPreview ? 'This is only a preview. In the real flow, nothing is sent until you approve the exact reviewed text.' : questionState.result ? 'This is a local privacy review only. No external answer request has been sent.' : 'Questions are enabled only after the local service confirms the uploaded document.'}</p></div></div>
+      <ReviewTimeline mode={mode} uploadStatus={uploadState.status} questionStatus={questionState.status} workflowResponse={questionState.result} reviewStatus={reviewState.status} answerReturned={Boolean(reviewState.result?.answer)}/>
+      <div className="control-note"><span className="note-lock"><Icon name="lock" size={24}/></span><div><strong>You’re in control</strong><p>{hasPreview ? 'This is only a preview. In the real flow, nothing is sent until you approve the exact reviewed text.' : reviewState.result?.answer ? 'The backend returned an answer for the exact request you approved.' : questionState.result ? 'Local privacy review is complete; no answer request is sent until you explicitly approve.' : 'Questions are enabled only after the local service confirms the uploaded document.'}</p></div></div>
     </aside>
   </main>;
 }
