@@ -8,8 +8,8 @@ import sys
 from typing import Any
 
 
-def _emit(code: str, text: str = "", page_count: int = 0) -> None:
-    result: dict[str, Any] = {"code": code, "text": text, "page_count": page_count}
+def _emit(code: str, text: str = "", page_count: int = 0, page_texts: list[str] | None = None) -> None:
+    result: dict[str, Any] = {"code": code, "text": text, "page_count": page_count, "page_texts": page_texts or []}
     sys.stdout.buffer.write(json.dumps(result, ensure_ascii=True).encode("ascii"))
 
 
@@ -46,7 +46,7 @@ def main() -> None:
         if not text.strip():
             _emit("no_extractable_text", page_count=page_count)
             return
-        _emit("ok", text, page_count)
+        _emit("ok", text, page_count, page_texts)
     except Exception:
         # Parser errors can include document-derived data; only return a safe code.
         _emit("invalid_pdf")
