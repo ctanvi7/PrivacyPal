@@ -10,6 +10,8 @@ export function getPrivacyProgress({
   uploadStatus = 'empty',
   questionStatus = 'idle',
   workflowResponse = null,
+  reviewStatus = 'empty',
+  answerReturned = false,
   illustrativePreview = false,
 } = {}) {
   const stages = STAGES.map(stage => ({ ...stage, status: 'pending', detail: 'Not started' }));
@@ -39,8 +41,13 @@ export function getPrivacyProgress({
     if (workflowResponse.review_complete === true) {
       stages[1].status = 'completed';
       stages[1].detail = 'Backend returned a complete local review.';
-      stages[2].status = 'in-progress';
-      stages[2].detail = 'Review is ready; approval is not connected in this frontend.';
+      stages[2].status = ['sending', 'acknowledging', 'saving-edit'].includes(reviewStatus) ? 'in-progress' :
+        ['review-blocked', 'review-error', 'send-error'].includes(reviewStatus) ? 'failed' :
+          ['sent'].includes(reviewStatus) ? 'completed' : 'in-progress';
+      stages[2].detail = reviewStatus === 'sent' ? 'Backend confirmed approval and submission.' :
+        reviewStatus === 'sending' ? 'Submitting the explicitly approved request.' :
+          reviewStatus === 'send-error' ? 'Approval result failed or is uncertain; do not retry this workflow.' :
+            'Review the exact text and approve explicitly before sending.';
     } else {
       stages[1].status = 'failed';
       stages[1].detail = 'Backend returned an incomplete local review.';
@@ -60,7 +67,19 @@ export function getPrivacyProgress({
     stages[1].detail = 'No valid backend review is available.';
   }
 
-  stages[3].detail = 'Answer delivery is not connected; no answer has been returned.';
+  if (answerReturned) {
+    stages[2].status = 'completed';
+    stages[3].status = 'completed';
+    stages[3].detail = 'Answer returned by the backend.';
+  } else if (reviewStatus === 'sending') {
+    stages[3].status = 'in-progress';
+    stages[3].detail = 'Waiting for the backend response to the approved request.';
+  } else if (reviewStatus === 'send-error') {
+    stages[3].status = 'failed';
+    stages[3].detail = 'No answer was confirmed; delivery may be uncertain.';
+  } else {
+    stages[3].detail = 'No answer has been returned.';
+  }
   return stages;
 }
 

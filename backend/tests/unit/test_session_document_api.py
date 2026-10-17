@@ -104,7 +104,7 @@ def test_create_session_returns_contract_response(client: TestClient) -> None:
     )
 
     assert response.status_code == 201
-    assert set(response.json()) == {"session_id", "expires_in_seconds"}
+    assert set(response.json()) == {"session_id", "expires_in_seconds", "conversation_id"}
     assert response.json()["expires_in_seconds"] == 1800
 
 
@@ -133,7 +133,7 @@ def test_upload_rejects_unknown_session(client: TestClient) -> None:
     response = _upload(client, "unknown", _make_pdf(["text"]))
 
     assert response.status_code == 404
-    assert response.json()["error"]["code"] == "SESSION_EXPIRED"
+    assert response.json()["error"]["code"] == "UNKNOWN_SESSION"
 
 
 def test_upload_rejects_oversized_file(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:

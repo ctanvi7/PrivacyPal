@@ -81,6 +81,21 @@ body{background-color:#0b0910;background-image:radial-gradient(ellipse 560px 480
 .timeline-item[data-status="pending"]:not(:last-child):before{background:rgba(210,199,224,.24);box-shadow:none}
 .timeline-item[data-status="failed"]:not(:last-child):before{background:linear-gradient(180deg,rgba(225,120,145,.72),rgba(145,71,96,.4));box-shadow:0 0 5px rgba(225,90,124,.2)}
 .recent-empty{margin:0 5px;padding:1px 0 0;color:#b9b2c0;font-size:11px;line-height:1.45}
+.history-row{display:flex;align-items:center;gap:2px}.history-row .recent{min-width:0;flex:1}.history-row .recent>span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.history-row .recent small{display:block;color:#b9b2c0;font-size:10px}.history-delete,.history-more{flex:none;border:1px solid transparent;border-radius:8px;background:transparent;color:#c9c1d0;padding:6px;display:grid;place-items:center}.history-delete:hover,.history-more:hover{background:rgba(255,255,255,.09);border-color:var(--border)}.history-delete:disabled{opacity:.55}.history-more{width:100%;display:block;margin-top:8px;font-size:11px}.recent-empty button{margin-top:5px;background:transparent;border:1px solid var(--border);border-radius:7px;color:inherit;padding:4px 7px}
 .preview-label{margin-top:20px}
 @keyframes privacy-progress-pulse{50%{box-shadow:0 0 13px rgba(181,53,224,.62)}}
 @media(prefers-reduced-motion:reduce){.step-number.in-progress{animation:none}}
+
+/* Small-screen navigation remains available without covering the chat controls. */
+.mobile-header-actions{display:none}
+@media(max-width:700px){
+  .mobile-header-actions{display:flex;align-items:center;gap:6px;flex:none}
+  .mobile-history,.mobile-privacy{display:inline-flex;align-items:center;justify-content:center;min-height:44px;padding:0 10px;border:1px solid var(--border);border-radius:11px;background:linear-gradient(145deg,#292631,#1b1922);color:#eee8f1;font-size:11px;line-height:1.2;text-align:center}
+  .mobile-privacy{width:auto;flex:none}
+  .sidebar.mobile-open{display:flex;width:calc(100% - 24px);max-height:70dvh;min-height:0;margin:12px;overflow:auto}
+  .privacy-panel{display:none}
+  .privacy-panel.mobile-open{display:flex;min-height:0;max-height:none;margin:0 12px 14px}
+  .history-delete,.icon-button{min-width:44px;min-height:44px}
+  .side-links button{min-height:44px}
+  .attach-button,.send-button{width:44px;height:44px}
+}

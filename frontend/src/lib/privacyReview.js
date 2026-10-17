@@ -1,92 +1,76 @@
 import { ApiError } from './apiClient.js';
 
+const BACKEND_ACTIONS = new Set(['keep', 'mask', 'replace', 'omit', 'block']);
+
 /**
- * Canonical review shape produced by an explicit backend adapter:
- * {
- *   originalRequestText: string,
- *   proposedOutgoingText: string,
- *   exactOutgoingText: string,
- *   recommendations: [{ action: 'keep'|'mask'|'replace', item: string,
- *     replacement?: string|null, reason: string }],
- *   riskFlags: [{ label: string, description?: string, level?: string }]
- * }
- * `level` is opaque backend-supplied text: this model defines no risk scale.
- * The adapter maps the backend schema into this canonical shape. The caller
- * must explicitly identify the raw value as backend-originated; demo objects
- * are not passed through this real-review normalization path.
+ * The confirmed backend currently returns question/draft/findings and a
+ * residual_review object. It does not return keep decisions, replacement
+ * values, or a separate risk-flag schema; this adapter displays only supplied
+ * values and does not infer missing classifications.
  */
+export function adaptBackendWorkflow(response) {
+  if (!response || typeof response !== 'object' || Array.isArray(response) ||
+      typeof response.question !== 'string' || typeof response.draft !== 'string' ||
+      !Array.isArray(response.findings) || !response.residual_review ||
+      !Array.isArray(response.residual_review.findings) || !Array.isArray(response.residual_review.reasons)) {
+    throw new TypeError('The backend workflow response is malformed.');
+  }
+  const recommendations = response.findings.map(item => {
+    if (!item || typeof item !== 'object' || !BACKEND_ACTIONS.has(item.action) ||
+        typeof item.category !== 'string' || typeof item.reason !== 'string') {
+      throw new TypeError('A backend finding is malformed.');
+    }
+    return { action: item.action, item: item.category, reason: item.reason };
+  });
+  const riskFlags = [
+    ...response.residual_review.findings.map(item => {
+      if (!item || typeof item !== 'object' || typeof item.category !== 'string' || typeof item.reason !== 'string') {
+        throw new TypeError('A backend residual finding is malformed.');
+      }
+      return { label: item.category, description: item.reason };
+    }),
+    ...response.residual_review.reasons.map(reason => {
+      if (typeof reason !== 'string') throw new TypeError('A backend risk reason is malformed.');
+      return { label: reason };
+    }),
+  ];
+  return {
+    originalRequestText: response.question,
+    proposedOutgoingText: response.draft,
+    exactOutgoingText: response.draft,
+    recommendations,
+    riskFlags,
+  };
+}
+
 export class PrivacyReviewDataError extends Error {
   constructor(message) { super(message); this.name = 'PrivacyReviewDataError'; }
 }
 
-function requiredText(value, field) {
-  if (typeof value !== 'string' || !value.trim()) {
-    throw new PrivacyReviewDataError(`Privacy review is missing valid ${field}.`);
-  }
-  return value;
-}
-
-export function normalizePrivacyReview(raw, adaptBackendReview, { source } = {}) {
-  if (source !== 'backend') {
-    throw new PrivacyReviewDataError('Only an explicitly identified backend response can become a real privacy review.');
-  }
-  if (typeof adaptBackendReview !== 'function') {
-    throw new PrivacyReviewDataError('A backend-specific review adapter is required.');
-  }
-  let canonical;
-  try {
-    canonical = adaptBackendReview(raw);
-  } catch {
-    throw new PrivacyReviewDataError('The backend privacy review could not be interpreted.');
-  }
-  if (!canonical || typeof canonical !== 'object' || Array.isArray(canonical)) {
-    throw new PrivacyReviewDataError('The backend privacy review could not be interpreted.');
-  }
-
-  const recommendations = canonical.recommendations;
-  if (!Array.isArray(recommendations) || recommendations.some(item =>
-    !item || !['keep', 'mask', 'replace'].includes(item.action) ||
-    typeof item.item !== 'string' || !item.item.trim() || typeof item.reason !== 'string' || !item.reason.trim() ||
-    (item.replacement !== undefined && item.replacement !== null && typeof item.replacement !== 'string')
-  )) {
-    throw new PrivacyReviewDataError('The backend privacy recommendations are malformed.');
-  }
-  const riskFlags = canonical.riskFlags;
-  if (!Array.isArray(riskFlags) || riskFlags.some(flag =>
-    !flag || typeof flag.label !== 'string' || !flag.label.trim() ||
-    (flag.description !== undefined && typeof flag.description !== 'string') ||
-    (flag.level !== undefined && typeof flag.level !== 'string')
-  )) {
-    throw new PrivacyReviewDataError('The backend risk flags are malformed.');
-  }
-
-  return Object.freeze({
-    originalRequestText: requiredText(canonical.originalRequestText, 'original request'),
-    proposedOutgoingText: requiredText(canonical.proposedOutgoingText, 'proposed outgoing text'),
-    exactOutgoingText: requiredText(canonical.exactOutgoingText, 'exact outgoing text'),
-    recommendations: Object.freeze(recommendations.map(item => Object.freeze({ ...item }))),
-    riskFlags: Object.freeze(riskFlags.map(flag => Object.freeze({ ...flag }))),
-    source: 'backend',
-  });
-}
-
 function initialState() {
-  return { status: 'empty', review: null, exactOutgoingText: '', approvalGranted: false, result: null, error: null };
+  return { status: 'empty', review: null, backendResponse: null, exactOutgoingText: '', approvalGranted: false, result: null, error: null };
 }
 
-function safeSendError(error) {
+function safeError(error, fallback) {
   if (error instanceof ApiError) return { code: error.code, message: error.message, retryable: error.retryable };
-  return { code: 'send_error', message: 'The approved request could not be submitted. Review its status before trying again.', retryable: false };
+  return { code: 'workflow_error', message: fallback, retryable: false };
 }
 
-/**
- * Manages editing and explicit approval. `sendApprovedRequest` is a
- * contract-specific adapter supplied only after the backend approval contract
- * exists. The callback receives the normalized review and exact edited text.
- */
-export function createPrivacyReviewController({ sendApprovedRequest, adaptBackendReview } = {}) {
+function reviewStatus(response) {
+  if (!response.review_complete || response.residual_review.status === 'blocked') return 'review-blocked';
+  return 'review-ready';
+}
+
+/** Coordinates backend edits, acknowledgement, and explicit single-use approval. */
+export function createPrivacyReviewController({
+  updateDraft,
+  acknowledgeReview,
+  sendApprovedRequest,
+  adaptBackendReview = adaptBackendWorkflow,
+} = {}) {
   let state = initialState();
   let active = null;
+  let sequence = 0;
   const listeners = new Set();
 
   function publish(next) {
@@ -96,78 +80,120 @@ export function createPrivacyReviewController({ sendApprovedRequest, adaptBacken
   }
 
   function load(raw, { source } = {}) {
+    if (source !== 'backend') {
+      return publish({ ...initialState(), status: 'review-error', error: { code: 'invalid_review', message: 'Only a confirmed backend response can become a real privacy review.', retryable: false } });
+    }
     try {
-      const review = normalizePrivacyReview(raw, adaptBackendReview, { source });
-      return publish({ status: 'review-ready', review, exactOutgoingText: review.exactOutgoingText, approvalGranted: false, result: null, error: null });
-    } catch (error) {
-      return publish({ ...initialState(), status: 'review-error', error: { code: 'invalid_review', message: error.message, retryable: false } });
+      const review = adaptBackendReview(raw);
+      if (!raw || raw.send_state !== 'review' || !Number.isInteger(raw.version) || typeof raw.workflow_id !== 'string') {
+        throw new TypeError('Invalid active workflow state.');
+      }
+      return publish({ ...initialState(), status: reviewStatus(raw), review, backendResponse: raw, exactOutgoingText: review.exactOutgoingText });
+    } catch {
+      return publish({ ...initialState(), status: 'review-error', error: { code: 'invalid_review', message: 'The backend privacy review could not be interpreted. Nothing was sent.', retryable: false } });
     }
   }
 
   function beginEditing() {
-    if (!['review-ready', 'awaiting-approval', 'approval-unavailable', 'send-error'].includes(state.status)) return state;
+    if (!['review-ready', 'review-blocked', 'awaiting-approval', 'awaiting-acknowledgement'].includes(state.status)) return state;
     return publish({ ...state, status: 'editing', approvalGranted: false, error: null });
   }
 
   function updateOutgoingText(text) {
     if (state.status !== 'editing' || typeof text !== 'string') return state;
-    return publish({ ...state, exactOutgoingText: text, error: null });
+    return publish({ ...state, exactOutgoingText: text, approvalGranted: false, error: null });
   }
 
   function finishEditing() {
-    if (state.status !== 'editing') return state;
-    return publish({ ...state, status: 'awaiting-approval', approvalGranted: false, error: null });
+    if (active) return active.promise;
+    if (state.status !== 'editing') return Promise.resolve(state);
+    const response = state.backendResponse;
+    const draft = state.exactOutgoingText.trim();
+    if (!draft) return Promise.resolve(publish({ ...state, error: { code: 'empty_outgoing_text', message: 'The final request must contain text before it can be reviewed.', retryable: false } }));
+    if (draft === response.draft) return Promise.resolve(publish({ ...state, status: state.backendResponse.acknowledged ? 'awaiting-approval' : reviewStatus(response), error: null }));
+    if (typeof updateDraft !== 'function') return Promise.resolve(publish({ ...state, status: 'review-error', error: { code: 'edit_unavailable', message: 'Request editing is unavailable. Nothing was sent.', retryable: false } }));
+
+    const op = { sequence: ++sequence, controller: new AbortController(), promise: null };
+    active = op;
+    publish({ ...state, status: 'saving-edit', approvalGranted: false, error: null });
+    op.promise = Promise.resolve()
+      .then(() => updateDraft({ workflowId: response.workflow_id, version: response.version, draft }, { signal: op.controller.signal }))
+      .then(updated => {
+        if (active !== op || op.controller.signal.aborted) return null;
+        return load(updated, { source: 'backend' });
+      })
+      .catch(error => {
+        if (active !== op || op.controller.signal.aborted) return null;
+        return publish({ ...state, status: 'review-error', approvalGranted: false, error: safeError(error, 'The edited request could not be revalidated. Start a new review before approval.') });
+      })
+      .finally(() => { if (active === op) active = null; });
+    return op.promise;
   }
 
   function confirmReview() {
     if (state.status !== 'review-ready') return state;
+    if (state.backendResponse.residual_review.status === 'needs_review' && !state.backendResponse.acknowledged) {
+      return publish({ ...state, status: 'awaiting-acknowledgement', approvalGranted: false, error: null });
+    }
     return publish({ ...state, status: 'awaiting-approval', approvalGranted: false, error: null });
+  }
+
+  function acknowledge() {
+    if (active) return active.promise;
+    if (state.status !== 'awaiting-acknowledgement' || typeof acknowledgeReview !== 'function') return Promise.resolve(state);
+    const response = state.backendResponse;
+    const op = { controller: new AbortController(), promise: null };
+    active = op;
+    publish({ ...state, status: 'acknowledging', approvalGranted: false, error: null });
+    op.promise = Promise.resolve()
+      .then(() => acknowledgeReview({ workflowId: response.workflow_id, version: response.version }, { signal: op.controller.signal }))
+      .then(updated => {
+        if (active !== op || op.controller.signal.aborted) return null;
+        const loaded = load(updated, { source: 'backend' });
+        if (loaded.status === 'review-ready' && updated.acknowledged) return publish({ ...state, status: 'awaiting-approval' });
+        return loaded;
+      })
+      .catch(error => {
+        if (active !== op || op.controller.signal.aborted) return null;
+        return publish({ ...state, status: 'review-error', approvalGranted: false, error: safeError(error, 'The review could not be acknowledged. Start a new review before approval.') });
+      })
+      .finally(() => { if (active === op) active = null; });
+    return op.promise;
   }
 
   function approve() {
     if (active) return active.promise;
     if (state.status === 'sent') return Promise.resolve(state.result);
     if (state.status !== 'awaiting-approval') return Promise.resolve(null);
-    if (!state.exactOutgoingText.trim()) {
-      publish({ ...state, error: { code: 'empty_outgoing_text', message: 'The final request must contain text before approval.', retryable: false } });
-      return Promise.resolve(null);
+    const response = state.backendResponse;
+    if (!response.review_complete || response.residual_review.status === 'blocked' || response.send_state !== 'review' ||
+        (response.residual_review.status === 'needs_review' && !response.acknowledged) ||
+        state.exactOutgoingText.trim() !== response.draft || !response.provider?.configured) {
+      return Promise.resolve(publish({ ...state, status: 'review-blocked', approvalGranted: false, error: { code: 'review_not_current', message: 'The current backend review does not approve this exact text. Edit and recheck it before sending.', retryable: false } }));
     }
     if (typeof sendApprovedRequest !== 'function') {
-      publish({ ...state, status: 'approval-unavailable', approvalGranted: false, error: { code: 'approval_unavailable', message: 'Sending is unavailable until the backend approval contract is connected. Nothing was sent.', retryable: false } });
-      return Promise.resolve(null);
+      return Promise.resolve(publish({ ...state, status: 'approval-unavailable', error: { code: 'approval_unavailable', message: 'Sending is unavailable. Nothing was sent.', retryable: false } }));
     }
 
-    const controller = new AbortController();
-    const payload = { review: state.review, exactOutgoingText: state.exactOutgoingText };
-    publish({ ...state, status: 'approved', approvalGranted: true, error: null });
-    const operation = { controller, promise: null };
-    operation.promise = Promise.resolve()
-      .then(() => {
-        if (active !== operation || controller.signal.aborted) return null;
-        publish({ ...state, status: 'sending', approvalGranted: true, error: null });
-        return sendApprovedRequest(payload, { signal: controller.signal });
-      })
+    const op = { controller: new AbortController(), promise: null };
+    active = op;
+    publish({ ...state, status: 'sending', approvalGranted: true, error: null });
+    op.promise = Promise.resolve()
+      .then(() => sendApprovedRequest({ workflowId: response.workflow_id, version: response.version, exactOutgoingText: response.draft }, { signal: op.controller.signal }))
       .then(result => {
-        if (active !== operation || controller.signal.aborted) return null;
-        publish({ ...state, status: 'sent', approvalGranted: true, result, error: null });
-        return result;
+        if (active !== op || op.controller.signal.aborted) return null;
+        return publish({ ...state, status: 'sent', approvalGranted: true, result, error: null });
       })
       .catch(error => {
-        if (active !== operation) return null;
-        publish({ ...state, status: 'send-error', approvalGranted: false, error: safeSendError(error) });
-        return null;
+        if (active !== op || op.controller.signal.aborted) return null;
+        return publish({ ...state, status: 'send-error', approvalGranted: false, error: safeError(error, 'The approval result is unknown or failed. Do not retry this workflow; start a new review if needed.') });
       })
-      .finally(() => { if (active === operation) active = null; });
-    active = operation;
-    return operation.promise;
-  }
-
-  function returnToEditing() {
-    if (!['send-error', 'approval-unavailable'].includes(state.status)) return state;
-    return publish({ ...state, status: 'editing', approvalGranted: false, error: null });
+      .finally(() => { if (active === op) active = null; });
+    return op.promise;
   }
 
   function reset() {
+    sequence += 1;
     if (active) active.controller.abort();
     active = null;
     return publish(initialState());
@@ -181,9 +207,16 @@ export function createPrivacyReviewController({ sendApprovedRequest, adaptBacken
     updateOutgoingText,
     finishEditing,
     confirmReview,
+    acknowledge,
     approve,
-    returnToEditing,
     reset,
-    canSend: typeof sendApprovedRequest === 'function',
+    get canApprove() {
+      const response = state.backendResponse;
+      return state.status === 'awaiting-approval' && !!response?.review_complete &&
+        response?.residual_review?.status !== 'blocked' && response?.send_state === 'review' &&
+        (response?.residual_review?.status !== 'needs_review' || response?.acknowledged === true) &&
+        state.exactOutgoingText.trim() === response?.draft && response?.provider?.configured === true &&
+        typeof sendApprovedRequest === 'function';
+    },
   });
 }

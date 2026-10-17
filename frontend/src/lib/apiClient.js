@@ -3,8 +3,12 @@ export const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 
 export const WORKFLOW_API_CONTRACT = Object.freeze({
   implemented: true,
-  connected: Object.freeze(['session creation', 'document upload', 'local question analysis']),
-  pending: Object.freeze(['draft editing', 'acknowledgement', 'approval and answer delivery']),
+  connected: Object.freeze([
+    'session creation', 'document upload', 'local question analysis',
+    'draft editing', 'review acknowledgement', 'explicit approval and answer delivery',
+    'conversation creation, listing, retrieval, and deletion',
+  ]),
+  pending: Object.freeze([]),
 });
 
 export class ApiError extends Error {
