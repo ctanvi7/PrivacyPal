@@ -21,6 +21,8 @@ class Settings:
     gemma_model: str = "gemma4:e4b"
     frontend_origin: str = "http://127.0.0.1:5173"
     model_timeout_seconds: float = 120.0
+    answer_provider_name: str | None = None
+    answer_provider_api_key: str | None = None
 
 
 def _positive_int(name: str, default: int) -> int:
@@ -84,4 +86,6 @@ def get_settings() -> Settings:
         gemma_model=os.getenv("GEMMA_MODEL", "gemma4:e4b"),
         frontend_origin=frontend_origin,
         model_timeout_seconds=_positive_float("MODEL_TIMEOUT_SECONDS", 120.0),
+        answer_provider_name=os.getenv("ANSWER_PROVIDER") or None,
+        answer_provider_api_key=os.getenv("ANSWER_PROVIDER_API_KEY") or None,
     )
