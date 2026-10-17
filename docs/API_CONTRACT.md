@@ -222,3 +222,15 @@ This document is a proposal, not an agreed implementation contract. Members 1 an
 - Provider/model selection, user-visible destination details, provider payload shape, credential configuration, and provider-specific response handling.
 - HTTP status mappings, error codes, and retryability semantics for endpoints beyond session creation and PDF upload, especially provider timeout or uncertain delivery.
 - Whether optional features such as placeholder restoration and source references are in scope and how they fit the API.
+
+## Implemented workflow routes
+
+The current FastAPI implementation uses these route names and fields (the proposal above remains useful as the behavioral contract):
+
+- `POST /api/v1/sessions/{session_id}/questions` runs Gemma's ordered local tools and returns `workflow_id`, `version`, the sanitized `draft`, safe `findings`, `residual_review`, and provider name/endpoint/configuration status. It does not contact the answer provider.
+- `PATCH /api/v1/sessions/{session_id}/workflows/{workflow_id}/draft` accepts `{ "version": 1, "draft": "..." }`, increments the version, clears acknowledgement, and reruns local checks, including Gemma's contextual review.
+- `POST /api/v1/sessions/{session_id}/workflows/{workflow_id}/acknowledge` accepts the current version and records the user's acknowledgement of remaining non-blocking warnings.
+- `POST /api/v1/sessions/{session_id}/workflows/{workflow_id}/approve` accepts the current version and optional `restore_placeholders`; the backend consumes approval before making one provider call and returns the answer in that response.
+- `POST /api/v1/sessions/{session_id}/workflows/{workflow_id}/cancel` discards an unsent review.
+
+The answer provider is configured through backend environment variables (`ANSWER_PROVIDER_NAME`, `ANSWER_PROVIDER_URL`, `ANSWER_PROVIDER_MODEL`, `ANSWER_PROVIDER_API_KEY`). The URL must use HTTPS. Its OpenAI-compatible adapter receives one user message containing exactly the current approved draft. It does not receive source text, other chat history, or the placeholder mapping. Provider errors are not automatically retried; an ambiguous failure is reported as delivery-unknown.
