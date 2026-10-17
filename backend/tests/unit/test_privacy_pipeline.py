@@ -52,6 +52,20 @@ def test_minimization_masks_pii_and_keeps_placeholder_mapping_private():
     assert "placeholder_map" not in draft.public_view()
 
 
+def test_irrelevant_sensitive_sentence_is_omitted_before_draft_construction():
+    source = (
+        "The annual salary is 80000 dollars.\n"
+        "Contact demo.person@example.test about an unrelated printer issue."
+    )
+
+    draft = build_sanitized_draft("What is the annual salary?", source)
+
+    assert "annual salary is 80000 dollars" in draft.text
+    assert "demo.person@example.test" not in draft.text
+    assert "printer issue" not in draft.text
+    assert draft.placeholder_map == {}
+
+
 def test_high_risk_secret_is_omitted_even_if_keep_is_suggested():
     question = "What is the deployment API key?"
     source = "The deployment API key=TEST_SECRET_DO_NOT_SEND_123 is configured for the meeting."
