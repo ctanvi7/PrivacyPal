@@ -369,7 +369,6 @@ The following are intentionally NOT part of this version:
 
 ### Nice to Have
 
-- Scanned PDF and image support, including OCR or local visual analysis.
 - Local placeholder restoration, so the user can choose to replace labels like “Person A” in the returned answer.
 - Source references, such as page numbers or excerpts showing which parts of the document support the answer.
 - More file formats, such as DOCX, if they can be handled reliably.
@@ -420,7 +419,7 @@ The following are intentionally NOT part of this version:
 - **Gemma must do meaningful work:** It should inspect the file and question, then use approved tool calls for actions such as finding sensitive content and preparing a minimized request.
 - **Controlled tool execution:** The backend must validate Gemma’s tool requests. Gemma cannot send data externally or run arbitrary code.
 - **External answer service:** Getting an answer from a cloud AI requires internet access and an API key. Only the user-approved sanitized request can be sent.
-- **Limited file support:** Start with pasted text and text-based PDFs. Scanned PDFs and images may require OCR or vision support, so add them only if the main flow is stable.
+- **Limited file support:** The MVP supports pasted text, PDFs, PNG, JPEG, and WebP, with local OCR for scanned PDF pages and images. Enforce configured size, page, dimension, and processing-time limits.
 - **Bounded file size and processing time:** Large or complex files may slow down local analysis or exceed available memory. Set a clear size limit and show progress and errors.
 - **Safe failure behavior:** If reading, Gemma analysis, or privacy checks fail, do not send the request.
 - **Temporary session data:** Avoid building a permanent file-storage system for the hackathon. Clear uploaded content and placeholder mappings when the session is cleared.
@@ -450,7 +449,7 @@ With the Hack Day approaching, set a firm feature cutoff:
 - **First:** Confirm that Gemma runs locally and can complete one valid tool-call workflow.
 - **Next:** Finish the core path—upload, ask, detect, sanitize, review, approve, and receive an answer.
 - **Then:** Test failures, secret blocking, cancellation, and the no-send-before-approval rule.
-- **Only after that:** Add image or scanned-PDF support, placeholder restoration, or citations if they work reliably.
+- **Only after that:** Add placeholder restoration or richer citations if they work reliably. Local OCR for scanned PDFs and images remains part of the MVP implementation scope.
 - **Final stretch:** Freeze features; rehearse the demo and pitch using synthetic data.
 
 ## 13. Definition of Done

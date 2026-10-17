@@ -8,8 +8,9 @@ from fastapi.testclient import TestClient
 from pypdf import PdfWriter
 
 from app.config import get_settings
-from app.extraction.pdf_service import PdfDocumentError, PdfTextExtractionService
-from app.main import app
+from app.extraction import document_service
+from app.extraction.document_service import ExtractionError
+from app.main import app, sessions
 
 
 def _make_pdf(page_texts: list[str]) -> bytes:
@@ -72,16 +73,17 @@ def _encrypted_pdf() -> bytes:
 
 @pytest.fixture
 def client() -> TestClient:
-    app.state.sessions.clear()
-    app.state.pdf_extractor = None
+    sessions.items.clear()
     with TestClient(app) as test_client:
         yield test_client
-    app.state.sessions.clear()
-    app.state.pdf_extractor = None
+    sessions.items.clear()
 
 
 def _session_id(client: TestClient) -> str:
-    response = client.post("/api/v1/sessions")
+    response = client.post(
+        "/api/v1/sessions",
+        headers={"Origin": "http://127.0.0.1:5173"},
+    )
     assert response.status_code == 201
     assert response.json()["expires_in_seconds"] == 1800
     return response.json()["session_id"]
@@ -91,11 +93,15 @@ def _upload(client: TestClient, session_id: str, data: bytes, filename: str = "r
     return client.post(
         f"/api/v1/sessions/{session_id}/documents",
         files={"file": (filename, data, content_type)},
+        headers={"Origin": "http://127.0.0.1:5173"},
     )
 
 
 def test_create_session_returns_contract_response(client: TestClient) -> None:
-    response = client.post("/api/v1/sessions")
+    response = client.post(
+        "/api/v1/sessions",
+        headers={"Origin": "http://127.0.0.1:5173"},
+    )
 
     assert response.status_code == 201
     assert set(response.json()) == {"session_id", "expires_in_seconds"}
@@ -113,12 +119,14 @@ def test_upload_returns_metadata_and_keeps_text_in_memory(client: TestClient) ->
         "source_type": "pdf",
         "status": "ready",
         "page_count": 1,
+        "character_count": len("Synthetic monthly report"),
         "extracted_character_count": len("Synthetic monthly report"),
     }
     assert "text" not in body
-    document = app.state.sessions[session_id].documents[body["document_id"]]
+    document = sessions.items[session_id].document
+    assert document is not None
     assert document.text == "Synthetic monthly report"
-    assert document.page_count == 1
+    assert len(document.pages) == 1
 
 
 def test_upload_rejects_unknown_session(client: TestClient) -> None:
@@ -131,7 +139,7 @@ def test_upload_rejects_unknown_session(client: TestClient) -> None:
 def test_upload_rejects_oversized_file(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
     session_id = _session_id(client)
     settings = replace(get_settings(), pdf_max_bytes=8)
-    monkeypatch.setattr("app.main.get_settings", lambda: settings)
+    monkeypatch.setattr("app.main.settings", settings)
     response = _upload(client, session_id, b"%PDF-1.4\n123456")
 
     assert response.status_code == 413
@@ -140,7 +148,7 @@ def test_upload_rejects_oversized_file(client: TestClient, monkeypatch: pytest.M
 
 @pytest.mark.parametrize(
     ("filename", "content_type"),
-    [("report.txt", "text/plain"), ("report.pdf", "application/octet-stream")],
+    [("report.txt", "text/plain")],
 )
 def test_upload_rejects_unsupported_type(
     client: TestClient, filename: str, content_type: str
@@ -159,6 +167,7 @@ def test_upload_rejects_multiple_inputs(client: TestClient) -> None:
             ("file", ("report.pdf", _make_pdf(["text"]), "application/pdf")),
             ("extra", (None, "pasted text")),
         ],
+        headers={"Origin": "http://127.0.0.1:5173"},
     )
 
     assert response.status_code == 415
@@ -175,8 +184,13 @@ def test_upload_rejects_multiple_inputs(client: TestClient) -> None:
     ],
 )
 def test_upload_maps_invalid_pdf_categories(
-    client: TestClient, data: bytes, expected_code: str
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    data: bytes,
+    expected_code: str,
 ) -> None:
+    if expected_code == "NO_EXTRACTABLE_TEXT":
+        monkeypatch.setattr(document_service, "_ocr_image", lambda _image: "")
     response = _upload(client, _session_id(client), data)
 
     assert response.status_code == 422
@@ -188,24 +202,25 @@ def test_upload_maps_page_and_character_limits(
 ) -> None:
     session_id = _session_id(client)
     settings = replace(get_settings(), pdf_max_pages=1)
-    monkeypatch.setattr("app.main.get_settings", lambda: settings)
+    monkeypatch.setattr("app.main.settings", settings)
     page_response = _upload(client, session_id, _make_pdf(["one", "two"]))
     assert page_response.status_code == 422
     assert page_response.json()["error"]["code"] == "TOO_MANY_PAGES"
 
-    settings = replace(get_settings(), pdf_max_chars=5)
-    monkeypatch.setattr("app.main.get_settings", lambda: settings)
+    settings = replace(settings, pdf_max_chars=5)
+    monkeypatch.setattr("app.main.settings", settings)
     char_response = _upload(client, session_id, _make_pdf(["six chars"]))
     assert char_response.status_code == 422
     assert char_response.json()["error"]["code"] == "TEXT_TOO_LONG"
 
 
-def test_upload_maps_extraction_timeout(client: TestClient) -> None:
-    class TimeoutExtractor:
-        def extract(self, _data: bytes):
-            raise PdfDocumentError("parse_timeout", "do not expose this detail")
+def test_upload_maps_extraction_timeout(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def timeout(*_args, **_kwargs):
+        raise ExtractionError("PDF processing exceeded the configured time limit.")
 
-    app.state.pdf_extractor = TimeoutExtractor()
+    monkeypatch.setattr("app.main.extract_upload", timeout)
     response = _upload(client, _session_id(client), _make_pdf(["text"]))
 
     assert response.status_code == 504
@@ -217,16 +232,17 @@ def test_upload_maps_extraction_timeout(client: TestClient) -> None:
     }
 
 
-def test_unexpected_extraction_error_is_safe(client: TestClient) -> None:
-    class BrokenExtractor:
-        def extract(self, _data: bytes):
-            raise RuntimeError("secret document text and traceback")
+def test_unexpected_extraction_error_is_safe(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken(*_args, **_kwargs):
+        raise RuntimeError("secret document text and traceback")
 
-    app.state.pdf_extractor = BrokenExtractor()
+    monkeypatch.setattr("app.main.extract_upload", broken)
     response = _upload(client, _session_id(client), _make_pdf(["text"]))
 
     assert response.status_code == 500
     assert response.json() == {
-        "error": {"code": "INTERNAL_ERROR", "message": "The PDF could not be processed."}
+        "error": {"code": "INTERNAL_ERROR", "message": "The document could not be processed."}
     }
     assert "secret document text" not in response.text

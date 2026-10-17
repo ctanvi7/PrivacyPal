@@ -1,15 +1,14 @@
-# Python virtual environments and interpreter artifacts
 .venv/
+backend/.venv/
 **/__pycache__/
 *.py[cod]
 *.egg-info/
-
-# Test and tool caches
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
-
-# Local environment files and secrets (keep examples trackable)
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
 .env
 .env.*
 !.env.example

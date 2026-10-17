@@ -16,7 +16,7 @@ PrivacyPal processes user-selected sensitive documents locally, uses Gemma for c
 - The frontend, FastAPI backend, and Ollama/Gemma runtime run on that same computer.
 - The backend listens on loopback only. It is not a LAN or public service.
 - There are no accounts, roles, shared workspaces, remote database, cloud file storage, or long-term chat history in the MVP.
-- MVP inputs are pasted text and text-based PDFs. Scanned PDFs and images/OCR are deferred until the main workflow is reliable.
+- MVP inputs are pasted text, PDFs, PNG, JPEG, and WebP. Text extraction and OCR are local; never add a hosted OCR fallback. Keep scanned/image OCR failures fail-closed.
 - The user selects each file explicitly. The app does not monitor folders, the clipboard, other apps, or the device.
 - Only a sanitized request approved by the user may be sent to a configured external answer provider.
 
@@ -118,13 +118,13 @@ Use these initial fail-closed limits and tune only after testing on the hackatho
 - Pasted text: at most **25,000 characters**.
 - PDF: at most **10 MiB**, **25 pages**, and **25,000 extracted characters**.
 - PDF parsing timeout: **15 seconds**. Local model work must have a configurable timeout; a timeout or resource-limit error stops the workflow.
-- One file per request. Reject encrypted/password-protected PDFs, unsupported formats, empty files, and PDFs with no extractable text in the MVP. Do not silently switch to OCR.
+- One file per request. Reject encrypted/password-protected PDFs, unsupported formats, empty files, and over-limit input. Use the local OCR adapter for scanned PDF pages and images; fail clearly if OCR is unavailable or fails.
 
 These are conservative starting limits, not claims that every allowed PDF is harmless. Keep limits configurable and enforce them in the backend, before expensive processing. Test on synthetic files and adjust only with documented measurements.
 
 ### Required handling
 
-- Allowlist PDF and plain pasted text for the MVP. Add image/scanned-PDF OCR only as a separately tested feature.
+- Allowlist PDF, PNG, JPEG, WebP, and plain pasted text for the MVP. OCR must run locally with the configured Tesseract adapter and be covered by synthetic tests.
 - Validate file size, extension, MIME type, and file signature; do not trust the filename or browser-supplied content type alone.
 - Use generated server-side temporary names. Prevent path traversal, overwrite, and public serving of uploads.
 - Parse in a maintained library with processing limits. Do not execute PDF JavaScript, embedded files, macros, links, or attachments. Do not follow URLs found in a document.
