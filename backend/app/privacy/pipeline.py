@@ -93,6 +93,10 @@ _PATTERNS: tuple[tuple[str, Action, str, re.Pattern[str]], ...] = (
     ("account_identifier", "mask", "A labeled account or identity number should be masked.",
      re.compile(r"(?i)\b(?:account|acct|member|customer|policy|claim|employee|student|patient)\s*(?:number|no\.?|id)\s*[:#=-]?\s*([A-Z0-9][A-Z0-9-]{3,})")),
 )
+_NON_PHONE_IDENTIFIER_PREFIX = re.compile(
+    r"(?i)\b(?:order|reference|ref|tracking|invoice|ticket|sku|product|batch|serial)"
+    r"\s*(?:code|number|no\.?|id)?\s*[:#=-]?\s*$"
+)
 
 
 def _luhn_valid(value: str) -> bool:
@@ -122,6 +126,8 @@ def scan_sensitive_data(text: str) -> ScanResult:
             start, end = match.span(1) if has_value_group else match.span()
             value = text[start:end]
             if category == "payment_card" and not _luhn_valid(value):
+                continue
+            if category == "phone" and _NON_PHONE_IDENTIFIER_PREFIX.search(text[max(0, start - 48):start]):
                 continue
             candidates.append((priority[action], category, action, reason, start, end, value))
             if len(candidates) > MAX_FINDINGS:

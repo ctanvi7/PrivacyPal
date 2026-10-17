@@ -16,7 +16,17 @@ python -m pip install -e ".\backend[dev]"
 
 Set `APP_HOST` to a loopback IP address and `APP_PORT` to an available port if the defaults are unsuitable. The application reads environment variables directly and does not load a `.env` file. `backend/.env.example` documents the current settings; export the desired values in your shell before starting the app. Local `.env` files are ignored by Git.
 
-To enable external answers, set `ANSWER_PROVIDER_NAME`, `ANSWER_PROVIDER_URL` (an HTTPS OpenAI-compatible `/chat/completions` endpoint), `ANSWER_PROVIDER_MODEL`, and `ANSWER_PROVIDER_API_KEY` in the backend environment. Keep the key out of source control and do not share it in chat. Without all four settings, local analysis and review work, but sending remains disabled. The provider receives one user message containing only the exact approved sanitized draft; it does not receive the original document, chat history, or placeholder mapping. Requests are not retried automatically.
+To enable Groq answers, set `GROQ_API_KEY` in the same PowerShell window before starting the backend. When set, PrivacyPal defaults to Groq's OpenAI-compatible chat-completions endpoint and the `openai/gpt-oss-120b` model. You can override the defaults with `ANSWER_PROVIDER_NAME`, `ANSWER_PROVIDER_URL`, `ANSWER_PROVIDER_MODEL`, and `ANSWER_PROVIDER_API_KEY`. Alternatively, configure those four variables for another HTTPS OpenAI-compatible provider. Keep API keys out of source control and do not share them in chat. Without a complete provider configuration, local analysis and review work, but sending remains disabled. The provider receives one user message containing only the exact approved sanitized draft; it does not receive the original document, chat history, or placeholder mapping. Requests are not retried automatically.
+
+For a hidden-key PowerShell prompt, run these commands in the window you will use to start the backend:
+
+```powershell
+$secureGroqKey = Read-Host "Groq API key" -AsSecureString
+$env:GROQ_API_KEY = [System.Net.NetworkCredential]::new("", $secureGroqKey).Password
+python backend/run.py
+```
+
+After stopping the backend, remove the key from that PowerShell process with `Remove-Item Env:GROQ_API_KEY`. The application reads environment variables directly and does not load `.env` files automatically.
 
 ## Run locally
 

@@ -133,7 +133,7 @@ def test_upload_rejects_unknown_session(client: TestClient) -> None:
     response = _upload(client, "unknown", _make_pdf(["text"]))
 
     assert response.status_code == 404
-    assert response.json()["error"]["code"] == "UNKNOWN_SESSION"
+    assert response.json()["error"]["code"] == "SESSION_EXPIRED"
 
 
 def test_upload_rejects_oversized_file(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:

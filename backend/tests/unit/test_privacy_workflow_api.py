@@ -178,7 +178,18 @@ def test_high_risk_value_added_by_edit_is_blocked(client, monkeypatch):
     assert sent == []
 
 
-def test_cancel_discards_workflow_without_provider_call(client):
+def test_cancel_discards_workflow_without_provider_call(client, monkeypatch):
+    sent = []
+
+    class FakeProvider:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def send(self, approved):
+            sent.append(approved)
+            return "Answer"
+
+    monkeypatch.setattr(main, "OpenAICompatibleProvider", FakeProvider)
     session_id, review = start_workflow(client)
     cancelled = client.post(
         f"/api/v1/sessions/{session_id}/workflows/{review['workflow_id']}/cancel",
@@ -191,6 +202,37 @@ def test_cancel_discards_workflow_without_provider_call(client):
         json={"version": review["version"]},
     )
     assert stale.status_code == 404
+    assert sent == []
+
+
+def test_unrelated_question_fails_closed_without_provider_call(client, monkeypatch):
+    sent = []
+
+    class FakeProvider:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def send(self, approved):
+            sent.append(approved)
+            return "Answer"
+
+    monkeypatch.setattr(main, "OpenAICompatibleProvider", FakeProvider)
+    session_id = client.post("/api/v1/sessions", headers=ORIGIN).json()["session_id"]
+    document = client.post(
+        f"/api/v1/sessions/{session_id}/documents",
+        headers=ORIGIN,
+        json={"pasted_text": "The garden has three rose bushes and a small fountain."},
+    ).json()
+
+    response = client.post(
+        f"/api/v1/sessions/{session_id}/questions",
+        headers=ORIGIN,
+        json={"document_id": document["document_id"], "question": "What is the account balance?"},
+    )
+
+    assert response.status_code == 503
+    assert "No request was sent externally." in response.json()["error"]["message"]
+    assert sent == []
 
 
 def test_unconfigured_provider_cannot_be_approved(client, monkeypatch):

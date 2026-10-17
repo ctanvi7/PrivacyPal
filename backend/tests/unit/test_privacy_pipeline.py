@@ -36,6 +36,37 @@ def test_valid_payment_card_pattern_is_high_risk():
     assert any(finding.category == "payment_card" and finding.action == "block" for finding in result.findings)
 
 
+def test_phone_like_order_code_is_not_misclassified_as_a_phone():
+    result = scan_sensitive_data("Synthetic order code: 123-456-7890")
+
+    assert not any(finding.category == "phone" for finding in result.findings)
+
+
+@pytest.mark.parametrize(
+    ("question", "source", "raw_value", "category"),
+    [
+        (
+            "What is the project contact email?",
+            "Project contact email: demo.person@example.test.",
+            "demo.person@example.test",
+            "email",
+        ),
+        (
+            "What is the synthetic office phone number?",
+            "Call the synthetic office at +1 (555) 010-1234.",
+            "+1 (555) 010-1234",
+            "phone",
+        ),
+    ],
+)
+def test_relevant_email_and_phone_values_are_masked(question, source, raw_value, category):
+    draft = build_sanitized_draft(question, source)
+
+    assert raw_value not in draft.text
+    assert f"[{category.upper()}_1]" in draft.text
+    assert raw_value in draft.placeholder_map.values()
+
+
 def test_minimization_masks_pii_and_keeps_placeholder_mapping_private():
     source = (
         "The project meeting starts at 3 PM; contact demo.person@example.test for details. "
