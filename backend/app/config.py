@@ -78,10 +78,18 @@ def get_settings() -> Settings:
     if origin.scheme != "http" or origin.hostname not in {"127.0.0.1", "localhost", "::1"} or not origin.port or origin.path not in {"", "/"} or origin.username or origin.password:
         raise ValueError("FRONTEND_ORIGIN must be a local HTTP origin with a port")
 
-    provider_name = os.getenv("ANSWER_PROVIDER_NAME", "OpenAI-compatible provider").strip()
-    provider_url = os.getenv("ANSWER_PROVIDER_URL", "").strip()
-    provider_model = os.getenv("ANSWER_PROVIDER_MODEL", "").strip()
-    provider_api_key = os.getenv("ANSWER_PROVIDER_API_KEY", "")
+    groq_api_key = os.getenv("GROQ_API_KEY", "")
+    provider_name = os.getenv(
+        "ANSWER_PROVIDER_NAME", "Groq" if groq_api_key else "OpenAI-compatible provider"
+    ).strip()
+    provider_url = os.getenv(
+        "ANSWER_PROVIDER_URL",
+        "https://api.groq.com/openai/v1/chat/completions" if groq_api_key else "",
+    ).strip()
+    provider_model = os.getenv(
+        "ANSWER_PROVIDER_MODEL", "openai/gpt-oss-120b" if groq_api_key else ""
+    ).strip()
+    provider_api_key = os.getenv("ANSWER_PROVIDER_API_KEY", "") or groq_api_key
     provider_configured = bool(provider_url or provider_model or provider_api_key)
     if provider_configured:
         parsed_provider = urlparse(provider_url)
