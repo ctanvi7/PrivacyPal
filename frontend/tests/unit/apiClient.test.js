@@ -26,6 +26,7 @@ test('uses the configured base URL and JSON-encodes request bodies', async () =>
   assert.equal(requestedUrl.href, 'http://localhost:8123/api/example');
   assert.equal(requestedOptions.headers.get('accept'), 'application/json');
   assert.equal(requestedOptions.headers.get('content-type'), 'application/json');
+  assert.equal(requestedOptions.credentials, 'include');
   assert.equal(requestedOptions.body, JSON.stringify({ question: 'Hi' }));
 });
 
@@ -97,5 +98,29 @@ test('does not allow requests to escape the configured origin', async () => {
   assert.equal(DEFAULT_API_BASE_URL, 'http://127.0.0.1:8000');
   await assert.rejects(client.request('https://example.com/private'), TypeError);
   assert.equal(WORKFLOW_API_CONTRACT.implemented, true);
-  assert.deepEqual(WORKFLOW_API_CONTRACT.pending, ['draft editing', 'acknowledgement', 'approval and answer delivery']);
+  assert.deepEqual(WORKFLOW_API_CONTRACT.pending, []);
+});
+
+test('model capacity errors preserve pending checks and allow a later manual retry', async () => {
+  const localChecks = { sensitive: 'pending', relevant: 'pending', residual: 'pending' };
+  const client = createApiClient({ fetchImpl: async () => new Response(JSON.stringify({ error: {
+    code: 'MODEL_BUSY', message: 'Gemma is busy with another privacy review.', retryable: true, local_checks: localChecks,
+  } }), { status: 429, headers: { 'content-type': 'application/json' } }) });
+  await assert.rejects(client.request('api/v1/sessions/synthetic/questions'), error => {
+    assert.equal(error.code, 'MODEL_BUSY');
+    assert.equal(error.retryable, true);
+    assert.deepEqual(error.localChecks, localChecks);
+    return true;
+  });
+});
+
+test('uses localhost for the default API when the UI is opened on localhost', () => {
+  const originalWindow = globalThis.window;
+  globalThis.window = { location: { hostname: 'localhost' } };
+  try {
+    assert.equal(createApiClient().baseUrl, 'http://localhost:8000/');
+  } finally {
+    if (originalWindow === undefined) delete globalThis.window;
+    else globalThis.window = originalWindow;
+  }
 });

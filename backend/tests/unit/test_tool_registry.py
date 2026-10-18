@@ -27,12 +27,43 @@ def test_native_tool_definitions_include_only_five_allowlisted_tools():
     ]
 
 
+def test_one_native_call_can_request_bound_inspection_and_verified_detection():
+    context = ToolContext("session", "workflow", "Explain maintenance.", (
+        {"page": 1, "text": "Maintenance for Maya Ellison: the tap leaks."},
+    ))
+    registry = ToolRegistry()
+    call = tool_call("detect_sensitive_data", {"terms": ["maintenance"], "sensitive_spans": [
+        {"category": "person_name", "value": "Maya Ellison"},
+    ]})
+    registry.execute(call, context)
+    assert context.executed_tools == ["inspect_document", "detect_sensitive_data"]
+    assert context.inspected_pages == (1,)
+    assert context.semantic_detection_complete
+    registry.prepare_draft(context)
+    assert "Maya Ellison" not in context.draft.text
+    with pytest.raises(ToolValidationError):
+        registry.execute(call, context)
+    assert not privacy_workflow_ready(context)  # Separate native audit remains required.
+
+
+@pytest.mark.parametrize("terms", [[], [""], ["x"] * 9, "maintenance"])
+def test_combined_call_rejects_invalid_search_terms_before_any_operation(terms):
+    context = ToolContext("session", "workflow", "Explain maintenance.", (
+        {"page": 1, "text": "The tap leaks."},
+    ))
+    with pytest.raises(ToolValidationError):
+        ToolRegistry().execute(tool_call("detect_sensitive_data", {"terms": terms, "sensitive_spans": []}), context)
+    assert context.executed_tools == []
+    assert context.scan is None
+
+
 @pytest.mark.parametrize(
     "call",
     [
         {"function": {"name": "run_shell", "arguments": {}}},
         tool_call("inspect_document", {"terms": [], "session_id": "outside"}),
         tool_call("detect_sensitive_data", {"text": "unbounded model input"}),
+        tool_call("detect_sensitive_data", {"terms": ["maintenance"]}),
         tool_call("review_residual_risk", {"risk_categories": ["email"], "draft": "raw secret"}),
     ],
 )
@@ -86,3 +117,54 @@ def test_registry_runs_bound_privacy_workflow_and_keeps_mapping_out_of_results()
     assert "demo.person@example.test" not in str(results[3])
     assert "[EMAIL_1]" in results[3]["text"]
     assert privacy_workflow_ready(context)
+
+
+def test_deterministic_preparation_requires_validated_detection_and_is_not_repeatable():
+    context = ToolContext("synthetic-session", "synthetic-workflow", "When is maintenance?", (
+        {"page": 1, "text": "Maintenance is on Tuesday. Contact fixture@example.test."},
+    ))
+    registry = ToolRegistry()
+    with pytest.raises(ToolValidationError):
+        registry.prepare_draft(context)
+    registry.execute(tool_call("inspect_document", {"terms": ["maintenance"]}), context)
+    with pytest.raises(ToolValidationError):
+        registry.prepare_draft(context)
+    registry.execute(tool_call("detect_sensitive_data", {"sensitive_spans": []}), context)
+    registry.prepare_draft(context)
+    assert context.draft is not None and context.selected.status == "selected"
+    assert not privacy_workflow_ready(context)  # Native final review is still mandatory.
+    with pytest.raises(ToolValidationError):
+        registry.prepare_draft(context)
+
+
+def test_selected_pages_follow_redacted_content_even_without_search_matches():
+    context = ToolContext("session", "workflow", "Explain the attached document.", (
+        {"page": 1, "text": "Resident: Maya\nEllison\nThe kitchen tap is leaking."},
+        {"page": 2, "text": "Repairs are scheduled for Tuesday."},
+        {"page": 3, "text": "x" * 8_000},
+    ))
+    registry = ToolRegistry()
+    registry.execute(tool_call("inspect_document", {"terms": ["attached", "document"]}), context)
+    assert context.inspected_pages == ()
+    registry.execute(tool_call("detect_sensitive_data", {"sensitive_spans": [
+        {"category": "person_name", "value": "Maya\nEllison"},
+    ]}), context)
+    registry.prepare_draft(context)
+    assert context.selected_pages == (1, 2)
+    assert "Maya" not in context.draft.text and "Ellison" not in context.draft.text
+    assert "kitchen tap is leaking" in context.draft.text
+    assert "Repairs are scheduled for Tuesday" in context.draft.text
+    assert "source_spans" not in context.draft.public_view()
+
+
+def test_pages_with_only_omitted_content_are_not_reported_as_used():
+    context = ToolContext("session", "workflow", "Explain the attached document.", (
+        {"page": 1, "text": "api_key=SYNTHETIC_SECRET"},
+        {"page": 2, "text": "The kitchen tap is leaking."},
+    ))
+    registry = ToolRegistry()
+    registry.execute(tool_call("inspect_document", {"terms": ["document"]}), context)
+    registry.execute(tool_call("detect_sensitive_data", {"sensitive_spans": []}), context)
+    registry.prepare_draft(context)
+    assert context.selected_pages == (2,)
+    assert "SYNTHETIC_SECRET" not in context.draft.text

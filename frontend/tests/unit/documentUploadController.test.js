@@ -141,6 +141,19 @@ test('cancels upload and clears selected and server-confirmed state on reset', a
   assert.equal(controller.getState().uploadedDocument, null);
 });
 
+test('forgets a removed document while retaining the active backend session', async () => {
+  const withSession = createDocumentUploadController({
+    createSession: async () => ({ session_id: 's-keep' }),
+    uploadDocument: async () => ({ document_id: 'd-keep', source_type: 'pdf', status: 'ready', page_count: 1, character_count: 4 }),
+  });
+  withSession.select(new File(['text'], 'report.pdf', { type: 'application/pdf' }));
+  await withSession.upload();
+  withSession.forgetDocument();
+  assert.equal(withSession.getState().selectedFile, null);
+  assert.equal(withSession.getState().uploadedDocument, null);
+  assert.equal(withSession.getState().session.session_id, 's-keep');
+});
+
 test('turns timeout into a retryable upload error without claiming success', async () => {
   const controller = createDocumentUploadController({
     createSession,

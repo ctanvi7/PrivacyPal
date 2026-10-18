@@ -52,6 +52,71 @@ def test_minimization_masks_pii_and_keeps_placeholder_mapping_private():
     assert "placeholder_map" not in draft.public_view()
 
 
+def test_broad_document_summary_uses_bounded_complete_sentences():
+    source = "Payment received for the synthetic receipt. Contact demo.person@example.test for support."
+
+    selected = select_relevant_content("Explain the attached document.", source)
+    draft = build_sanitized_draft("Explain the attached document.", source)
+
+    assert selected.status == "selected"
+    assert selected.text == source
+    assert "demo.person@example.test" not in draft.text
+    assert "[EMAIL_1]" in draft.text
+
+
+@pytest.mark.parametrize("question", [
+    "explain this please", "Can you explain this?", "Please summarise it briefly",
+    "Describe it in simple terms", "Please summarize",
+])
+def test_generic_requests_use_bound_document_and_still_mask_identifiers(question):
+    source = "The kitchen tap is leaking. Contact demo.person@example.test for repairs."
+    selected = select_relevant_content(question, source)
+    draft = build_sanitized_draft(question, source)
+    assert selected.text == source
+    assert "kitchen tap is leaking" in draft.text
+    assert "demo.person@example.test" not in draft.text
+    assert "[EMAIL_1]" in draft.text
+    assert draft.source_spans
+
+
+def test_explanation_with_a_topic_does_not_expand_to_the_whole_document():
+    source = "Rent is due each month. The kitchen tap is leaking."
+    selected = select_relevant_content("Explain this rent charge please", source)
+    assert selected.text == "Rent is due each month."
+    assert select_relevant_content("Explain quantum mechanics please", source).status == "no_relevant_content"
+
+
+def test_overview_includes_facts_even_when_only_heading_matches_question():
+    source = "Attached document\nThe kitchen tap is leaking.\nContact demo.person@example.test for repairs."
+    draft = build_sanitized_draft("Explain the attached document.", source)
+    assert "kitchen tap is leaking" in draft.text
+    assert "demo.person@example.test" not in draft.text
+    assert "[EMAIL_1]" in draft.text
+
+
+def test_overview_skips_oversized_sentence_without_cutting_it():
+    source = "x" * 200 + "\nThe tap leaks.\nRepair is pending."
+    selected = select_relevant_content("Summarize the document.", source, max_chars=33)
+    assert selected.text == "The tap leaks. Repair is pending."
+    assert len(selected.text) <= 33
+
+
+@pytest.mark.parametrize("source", ["", "unrelated information", "x" * 8_000])
+def test_unusable_context_cannot_create_question_only_draft(source):
+    with pytest.raises(PrivacyCheckError):
+        build_sanitized_draft("When is maintenance scheduled?", source)
+
+
+def test_redaction_cannot_leave_an_empty_context_or_exceed_draft_limit():
+    with pytest.raises(PrivacyCheckError):
+        build_sanitized_draft("Explain the attached document.", "api_key=SYNTHETIC_SECRET")
+    question = "Explain the attached document."
+    source = "Email: a@b.co"
+    limit = len(f"Question: {question}\n\nRelevant context:\n{source}")
+    with pytest.raises(PrivacyCheckError):
+        build_sanitized_draft(question, source, max_chars=limit)
+
+
 def test_high_risk_secret_is_omitted_even_if_keep_is_suggested():
     question = "What is the deployment API key?"
     source = "The deployment API key=TEST_SECRET_DO_NOT_SEND_123 is configured for the meeting."

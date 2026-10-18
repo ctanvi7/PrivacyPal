@@ -1,3 +1,5 @@
+import { CLOUD_HOSTED } from './deployment.js';
+
 const SUPPORTED_MIME_TYPES = new Set([
   'application/pdf',
   'image/png',
@@ -16,6 +18,7 @@ export const UNSUPPORTED_DOCUMENT_MESSAGE =
  */
 export function getDocumentValidationError(file) {
   if (!file) return null;
+  if (CLOUD_HOSTED && file.size > 4 * 1024 * 1024) return 'AWS demo uploads are limited to 4 MiB.';
 
   const name = typeof file.name === 'string' ? file.name : '';
   const extension = name.includes('.') ? name.split('.').pop().toLowerCase() : '';

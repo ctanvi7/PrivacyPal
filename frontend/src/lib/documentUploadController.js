@@ -64,7 +64,7 @@ export function createDocumentUploadController({
     return publish({
       status: 'selected',
       selectedFile: file,
-      session: null,
+      session: state.session,
       uploadedDocument: null,
       uploadedSessionId: null,
       error: null,
@@ -74,6 +74,11 @@ export function createDocumentUploadController({
   function reset() {
     stopActive();
     return publish(initialState());
+  }
+
+  function forgetDocument() {
+    stopActive();
+    return publish({ ...initialState(), session: state.session });
   }
 
   function cancel() {
@@ -189,5 +194,6 @@ export function createDocumentUploadController({
     retry: upload,
     cancel,
     reset,
+    forgetDocument,
   });
 }

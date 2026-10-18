@@ -17,3 +17,7 @@ frontend/.vite/
 !**/.env.example
 *.secret
 secrets/
+backups/
+deploy/aws/deployment.json
+/tmp/
+/backend/tmp_*.py

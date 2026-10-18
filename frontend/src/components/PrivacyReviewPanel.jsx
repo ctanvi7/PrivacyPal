@@ -1,104 +1,56 @@
-const STATUS_LABELS = {
-  'review-ready': 'Review the proposed text and recommendations.',
-  editing: 'Editing the exact outgoing text.',
-  'awaiting-approval': 'The final text is ready. Approve explicitly to send it.',
-  approved: 'Approval recorded; preparing the approved submission.',
-  sending: 'Submitting the explicitly approved text.',
-  sent: 'The backend confirmed the approved request was submitted.',
-  'approval-unavailable': 'Sending is unavailable. Nothing was sent.',
-  'send-error': 'Submission failed. Review the final text before trying again.',
-};
+import { useState } from 'react';
+import { getWorkflowStatus } from '../lib/workflowActions.js';
+import SafeMarkdown from './SafeMarkdown.js';
 
-function BackendAnalysis({ response }) {
-  const residual = response.residual_review;
-  const residualFindings = Array.isArray(residual.findings) ? residual.findings : [];
-  return <section className="review-card glass-panel" aria-labelledby="backend-review-title">
-    <div className="review-top"><span className="review-lock" aria-hidden="true">✓</span><div className="review-title"><h2 id="backend-review-title">Local privacy review</h2><p>{response.review_complete ? 'The backend returned this local review. Nothing has been sent to an answer provider.' : 'The backend returned an incomplete review. Nothing has been sent to an answer provider.'}</p></div></div>
-    <section aria-labelledby="backend-question-title"><h3 id="backend-question-title">Your question</h3><p>{response.question}</p></section>
-    <section aria-labelledby="backend-draft-title"><h3 id="backend-draft-title">Proposed request · not sent</h3><pre className="request-preview">{response.draft}</pre></section>
-    <section aria-labelledby="backend-findings-title"><h3 id="backend-findings-title">Privacy findings returned by the backend</h3>
-      {response.findings.length ? <ul>{response.findings.map((finding, index) => <li key={finding.finding_id || index}>
-        <strong>{finding.category || 'Finding'}</strong>{finding.action && <> · {finding.action}</>}{finding.reason && <p>{finding.reason}</p>}
-      </li>)}</ul> : <p>The backend returned no findings.</p>}
-    </section>
-    <section aria-labelledby="backend-residual-title"><h3 id="backend-residual-title">Remaining review</h3><p>Status returned: {residual.status || 'unspecified'}</p>
-      {residualFindings.length > 0 && <ul>{residualFindings.map((finding, index) => <li key={finding.finding_id || index}>{finding.category || 'Finding'}{finding.action && <> · {finding.action}</>}{finding.reason && <p>{finding.reason}</p>}</li>)}</ul>}
-      {Array.isArray(residual.reasons) && residual.reasons.length > 0 && <ul>{residual.reasons.map((reason, index) => <li key={index}>{reason}</li>)}</ul>}
-    </section>
-    <p className="review-footnote">Workflow {response.workflow_id} · version {response.version} · pages used: {response.pages_used.length ? response.pages_used.join(', ') : 'none reported'} · state: {response.send_state} · acknowledged: {response.acknowledged ? 'yes' : 'no'} · provider: {response.provider.name || 'not supplied'} ({response.provider.configured ? 'configured' : 'not configured'})</p>
-  </section>;
+function Icon({ name }) {
+  const paths = {
+    lock: <><rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3m-4 4v3"/></>,
+    send: <><path d="m21 3-7.5 18-3.8-7.7L2 9.5 21 3Z"/><path d="m9.7 13.3 5-5"/></>,
+    edit: <><path d="m15 5 4 4M4 20l4.3-.9L19 8.4a2.8 2.8 0 0 0-4-4L4.3 15.1 4 20Z"/></>,
+  };
+  return <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{paths[name]}</svg>;
 }
 
-export default function PrivacyReviewPanel({ state, controller, workflowResponse }) {
-  if (workflowResponse) return <BackendAnalysis response={workflowResponse}/>;
-  const review = state.review;
-  if (!review || review.source !== 'backend') return null;
-  const editing = state.status === 'editing';
+export default function PrivacyReviewPanel({ response, busy = false, error = '', onEdit, onAcknowledge, onApprove, onCancel }) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(response.draft);
+  const residual = response.residual_review || {};
+  const providerConfigured = response.provider?.configured === true;
+  const residualReviewable = ['ready_for_user_review', 'needs_review'].includes(residual.status);
+  const needsWarningAck = residual.status === 'needs_review' && !response.acknowledged;
+  const canApprove = providerConfigured && response.review_complete && residualReviewable && !needsWarningAck && response.send_state === 'review' && !busy;
+  const disabledReason = !providerConfigured
+    ? 'Approval is unavailable because the answer provider is not configured.'
+    : residual.status === 'blocked' ? 'Approval is blocked until identifying details are removed or replaced and the request is rechecked.'
+      : !response.review_complete ? 'Approval is unavailable until all privacy checks are complete.'
+        : !residualReviewable ? 'Approval is unavailable because the remaining-clue check is incomplete.'
+        : needsWarningAck ? 'Review and acknowledge the remaining privacy warning before approval.'
+          : response.send_state !== 'review' ? `Approval is unavailable while this review is ${response.send_state}.` : '';
+  const answer = response.send_state === 'answer_withheld' ? null : response.answer;
+  const status = getWorkflowStatus(response);
 
-  return <section className="review-card glass-panel" aria-labelledby="backend-review-title">
-    <div className="review-top">
-      <span className="review-lock" aria-hidden="true"><svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3m-4 4v3"/></svg></span>
-      <div className="review-title">
-        <h2 id="backend-review-title">Review before sending</h2>
-        <p>{STATUS_LABELS[state.status] || 'Review the backend-provided request.'}</p>
-      </div>
-    </div>
+  async function saveDraft() {
+    const updated = await onEdit(draft);
+    if (updated) { setDraft(updated.draft); setEditing(false); }
+  }
 
-    <section aria-labelledby="review-original-title">
-      <h3 id="review-original-title">Original question or request</h3>
-      <p>{review.originalRequestText}</p>
-    </section>
-    <section aria-labelledby="review-proposal-title">
-      <h3 id="review-proposal-title">Proposed outgoing text</h3>
-      <p>{review.proposedOutgoingText}</p>
-    </section>
-
-    <section aria-labelledby="review-recommendations-title">
-      <h3 id="review-recommendations-title">Privacy recommendations</h3>
-      {review.recommendations.length ? <ul>
-        {review.recommendations.map((item, index) => <li key={`${item.action}-${item.item}-${index}`}>
-          <strong>{item.action.toUpperCase()}</strong> {item.item}
-          {item.replacement != null && <> → {item.replacement}</>}
-          <p>{item.reason}</p>
-        </li>)}
-      </ul> : <p>No recommendations were supplied by the backend.</p>}
-    </section>
-
-    <section aria-labelledby="review-risks-title">
-      <h3 id="review-risks-title">Remaining risk flags</h3>
-      {review.riskFlags.length ? <ul>
-        {review.riskFlags.map((flag, index) => <li key={`${flag.label}-${index}`}>
-          <strong>{flag.label}</strong>{flag.level && <> · {flag.level}</>}
-          {flag.description && <p>{flag.description}</p>}
-        </li>)}
-      </ul> : <p>No risk flags were supplied by the backend.</p>}
-    </section>
-
-    <section aria-labelledby="review-final-text-title">
-      <h3 id="review-final-text-title">Exact text after edits</h3>
-      <label className="visually-hidden" htmlFor="backend-final-request">Final outgoing request</label>
-      <textarea
-        id="backend-final-request"
-        className="request-preview"
-        value={state.exactOutgoingText}
-        readOnly={!editing}
-        onChange={event => controller.updateOutgoingText(event.target.value)}
-      />
-    </section>
-
-    {state.error && <p className="notice" role="alert">{state.error.message}</p>}
+  return <section className="review-card glass-panel" aria-labelledby="review-title">
+    <div className="review-top"><span className="review-lock"><Icon name="lock"/></span><div className="review-title"><h2 id="review-title">{response.send_state === 'sent' ? 'Answer received' : response.send_state === 'answer_withheld' ? 'Answer withheld' : response.send_state === 'delivery_unknown' ? 'Answer provider failed' : 'Review before sending'}</h2><p>{status.detail}</p></div><span className={`risk-pill state-${residual.status || 'pending'}`}><i/>{status.label}</span></div>
+    <p className="provider-line">{providerConfigured ? `Answer provider: ${response.provider.name}` : `Answer provider ${response.provider?.name || ''} is not configured`}</p>
+    {error && <p className="notice" role="alert">{error}</p>}
+    {answer && <section className="answer-result" aria-label="Provider answer" aria-live="polite"><div className="answer-label">Answer</div><SafeMarkdown>{answer}</SafeMarkdown><small>{response.provider?.name || 'Provider'}{Array.isArray(response.pages_used) && response.pages_used.length ? ` · pages ${response.pages_used.join(', ')}` : ''}</small></section>}
+    <details className="request-disclosure" open={!answer || editing}>
+      <summary><span>Exact request to be sent</span><small>Version {response.version}</small></summary>
+      <p className="request-caption">Inspect the exact text {answer ? 'approved for this answer' : 'before approving'}. The original document is not attached.</p>
+      {editing ? <><label className="visually-hidden" htmlFor="sanitized-request">Exact sanitized request</label><textarea id="sanitized-request" className="request-preview request-editor" value={draft} readOnly={busy} onChange={event => setDraft(event.target.value)} /></>
+        : <div className="request-preview" role="region" aria-label="Exact sanitized request" tabIndex={0}>{response.draft}</div>}
+    </details>
     <div className="review-actions">
-      {state.status === 'review-ready' && <>
-        <button className="edit-button" type="button" onClick={() => controller.beginEditing()}>Edit request</button>
-        <button className="approve-button" type="button" onClick={() => controller.confirmReview()}>Continue to approval</button>
-      </>}
-      {editing && <button className="edit-button" type="button" onClick={() => controller.finishEditing()}>Show final text for approval</button>}
-      {state.status === 'awaiting-approval' && <>
-        <button className="edit-button" type="button" onClick={() => controller.beginEditing()}>Edit request</button>
-        <button className="approve-button" type="button" disabled={!controller.canSend} onClick={() => controller.approve()}>Approve exact text &amp; send</button>
-      </>}
-      {state.status === 'awaiting-approval' && !controller.canSend && <p className="review-footnote">Sending is unavailable until the backend approval contract is connected. Nothing will be sent.</p>}
-      {['approval-unavailable', 'send-error'].includes(state.status) && <button className="edit-button" type="button" onClick={() => controller.returnToEditing()}>Return to editing</button>}
+      {editing ? <><button className="approve-button" type="button" onClick={saveDraft} disabled={busy || !draft.trim()}>{busy ? 'Checking…' : 'Save and recheck'}</button><button className="edit-button" type="button" onClick={() => { setDraft(response.draft); setEditing(false); }} disabled={busy}>Discard edits</button></>
+        : <><button className="approve-button" type="button" onClick={onApprove} disabled={!canApprove}><Icon name="send"/>{busy ? 'Working…' : response.send_state === 'sent' ? 'Answer received' : response.send_state === 'answer_withheld' ? 'Answer withheld' : response.send_state === 'delivery_unknown' ? 'Provider delivery failed' : 'Approve & get answer'}</button><button className="edit-button" type="button" onClick={() => { setDraft(response.draft); setEditing(true); }} disabled={busy || !!answer || response.send_state !== 'review'}><Icon name="edit"/>Edit request</button></>}
     </div>
+    {!editing && <p className={`review-footnote ${canApprove ? 'approval-ready' : ''}`}><span className="info-icon">i</span>{canApprove ? 'Only this exact text will be sent after your approval.' : disabledReason || 'The request has already been submitted.'}</p>}
+    {needsWarningAck && <button className="acknowledge-button" type="button" onClick={onAcknowledge} disabled={busy}>I reviewed the remaining warning</button>}
+    {!answer && response.send_state === 'review' && <button className="cancel-review" type="button" onClick={onCancel} disabled={busy}>Cancel review</button>}
   </section>;
 }

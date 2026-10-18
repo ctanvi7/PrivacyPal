@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { ApiError, createApiClient } from '../../src/lib/apiClient.js';
-import { createPrivacyPalApi, mapWorkflowResponse } from '../../src/lib/privacyPalApi.js';
+import { createPrivacyPalApi, mapWorkflowResponse, PRIVACY_ANALYSIS_TIMEOUT_MS } from '../../src/lib/privacyPalApi.js';
 
 function jsonResponse(data, status = 200) {
   return new Response(JSON.stringify(data), { status, headers: { 'content-type': 'application/json' } });
@@ -35,6 +35,23 @@ test('uploads one multipart file field without setting Content-Type manually', a
   await assert.rejects(missingId.uploadDocument('s-1', file), error => error.code === 'invalid_response');
 });
 
+test('removes documents and clears sessions only after backend confirmation', async () => {
+  const calls = [];
+  const api = createPrivacyPalApi({ client: { request: async (...args) => {
+    calls.push(args);
+    return { status: args[1].method === 'DELETE' ? 'removed' : 'cleared' };
+  } } });
+  assert.deepEqual(await api.removeDocument('s-1', 'd/1'), { status: 'removed' });
+  assert.deepEqual(await api.clearSession('s-1'), { status: 'cleared' });
+  assert.equal(calls[0][0], 'api/v1/sessions/s-1/documents/d%2F1');
+  assert.equal(calls[0][1].method, 'DELETE');
+  assert.equal(calls[1][0], 'api/v1/sessions/s-1/clear');
+  assert.equal(calls[1][1].method, 'POST');
+  const failed = createPrivacyPalApi({ client: { request: async () => ({ status: 'failed' }) } });
+  await assert.rejects(failed.clearSession('s-1'), error => error.code === 'invalid_response');
+  await assert.rejects(failed.removeDocument('s-1', 'd-1'), error => error.code === 'invalid_response');
+});
+
 test('submits question JSON to the session route and preserves actual workflow fields', async () => {
   let call;
   const backendResponse = {
@@ -49,6 +66,8 @@ test('submits question JSON to the session route and preserves actual workflow f
   assert.equal(call[0], 'api/v1/sessions/s-1/questions');
   assert.equal(call[1].method, 'POST');
   assert.deepEqual(call[1].body, { document_id: 'd-1', question: 'What total?' });
+  assert.equal(call[1].timeoutMs, PRIVACY_ANALYSIS_TIMEOUT_MS);
+  assert.equal(PRIVACY_ANALYSIS_TIMEOUT_MS, 3 * 120_000 + 30_000);
   assert.deepEqual(response, backendResponse);
   assert.equal(response.findings[0].reason, 'Identifier');
   assert.equal(response.backend_extra, 'kept');

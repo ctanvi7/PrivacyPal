@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 import httpx
+from app.privacy.grounding import GROUNDING_INSTRUCTIONS
 
 MAX_PROVIDER_REQUEST_CHARS = 8_000
 MAX_PROVIDER_RESPONSE_BYTES = 64 * 1024
@@ -28,7 +29,8 @@ class OpenAICompatibleProvider:
     """Send only the exact server-approved sanitized content, with no retry."""
 
     def __init__(self, *, url: str, model: str, api_key: str, timeout_seconds: float = 30.0) -> None:
-        self.url = url
+        base_url = url.rstrip("/")
+        self.url = base_url if base_url.endswith("/chat/completions") else f"{base_url}/chat/completions"
         self.model = model
         self.api_key = api_key
         self.timeout_seconds = timeout_seconds
@@ -40,7 +42,10 @@ class OpenAICompatibleProvider:
             raise ProviderError("The approved request is empty or exceeds the provider limit.")
         payload = {
             "model": self.model,
-            "messages": [{"role": "user", "content": approved.content}],
+            "messages": [
+                {"role": "system", "content": GROUNDING_INSTRUCTIONS},
+                {"role": "user", "content": approved.content},
+            ],
             "stream": False,
         }
         try:

@@ -233,4 +233,45 @@ The current FastAPI implementation uses these route names and fields (the propos
 - `POST /api/v1/sessions/{session_id}/workflows/{workflow_id}/approve` accepts the current version and optional `restore_placeholders`; the backend consumes approval before making one provider call and returns the answer in that response.
 - `POST /api/v1/sessions/{session_id}/workflows/{workflow_id}/cancel` discards an unsent review.
 
-The answer provider is configured through backend environment variables (`ANSWER_PROVIDER_NAME`, `ANSWER_PROVIDER_URL`, `ANSWER_PROVIDER_MODEL`, `ANSWER_PROVIDER_API_KEY`). The URL must use HTTPS. Its OpenAI-compatible adapter receives one user message containing exactly the current approved draft. It does not receive source text, other chat history, or the placeholder mapping. Provider errors are not automatically retried; an ambiguous failure is reported as delivery-unknown.
+The answer provider is configured through backend environment variables (`ANSWER_PROVIDER_NAME`, `ANSWER_PROVIDER_URL`, `ANSWER_PROVIDER_MODEL`, `ANSWER_PROVIDER_API_KEY`). The URL must use HTTPS. Its OpenAI-compatible adapter receives a fixed system instruction limiting answers to the approved content and forbidding invented personal/document details, plus one user message containing exactly the current approved draft. It does not receive source text, other chat history, or the placeholder mapping. Provider errors are not automatically retried; an ambiguous failure is reported as delivery-unknown.
+
+
+### Outbound identity and answer-grounding checks
+
+The current workflow scans labeled personal names, email/phone patterns, street addresses, and lease/reference identifiers in addition to the existing secret patterns. Known source identifiers are checked locally against the exact draft after editing and again before approval. Identity-seeking requests with unresolved or uncertain identifying context are returned as blocked reviews (`review_complete: false`); acknowledgement cannot authorize them. The user must edit and recheck, or cancel. Zero findings does not prove safety.
+
+After provider delivery, the backend checks personal-looking answer details against the approved request before storing or returning the answer, and before any explicitly requested local placeholder restoration. If unsupported details are detected or this check fails, it withholds the entire answer, stores no answer text, consumes the approval with `send_state: "answer_withheld"`, and returns HTTP 502:
+
+```json
+{
+  "error": {
+    "code": "ANSWER_WITHHELD",
+    "message": "The provider answer was withheld because its personal details could not be verified against the approved request. No automatic retry was made.",
+    "retryable": false
+  }
+}
+```
+
+The frontend preserves the completed privacy review and shows an answer-withheld error without rendering the unverified answer. Retrying this approval is rejected. These conservative pattern and name-shape checks can miss details or flag benign text; they do not establish exhaustive detection or verify every document fact. The provider receives neither the local source comparison nor the placeholder mapping.
+
+
+### Local semantic detection and per-step status
+
+Gemma now sees the bounded source locally during `detect_sensitive_data` and may return `sensitive_spans`, an array of `{ "category": "person_name", "value": "exact source substring" }` proposals. The backend validates category, shape, count, length, and actual source occurrence (allowing PDF whitespace differences). Unknown values, malformed calls, and truncated responses fail closed. Verified model detections augment deterministic scanning; only backend code applies placeholders or omission. Values and source text are never added to the Groq payload or public detection metadata.
+
+The final Gemma residual review receives only the current sanitized request, not source values from earlier tool history. Remaining identifying content can still block approval. A successful local check does not establish exhaustive detection.
+
+Workflow responses include `local_checks` with `sensitive`, `relevant`, and `residual` statuses. These report completed work separately from the aggregate `review_complete` approval prerequisite. A blocked residual review can have completed detection and selection; the frontend must not label those successful steps as failed, and must still disable approval. Edits clear and recompute status.
+
+
+If the final residual tool identifies exact `sensitive_spans` still in the draft, the backend validates and redacts them locally and permits exactly one fresh residual tool call. The changed draft is never treated as approved or clean merely because it was redacted. Missing, malformed, truncated, or unresolved second results remain unavailable or blocked, with no provider send. The local-analysis client timeout covers at most three bounded model calls (two normally, plus one residual recheck). Source spans are redacted before line-based relevance selection so multiline PDF values cannot be split into unmasked fragments.
+
+Initial-review failures return HTTP 503 with `error.code = LOCAL_ANALYSIS_FAILED` and safe `error.local_checks` statuses (`sensitive`, `relevant`, `residual`: `completed`, `failed`, or `pending`). Completed checks stay completed in the UI; no workflow or partial findings are created for approval. Error messages identify detection, draft preparation, or residual review without exposing model output. The backend performs deterministic selection and draft construction after validated native detection, avoiding two empty-argument model round trips. Native final review remains mandatory.
+
+Document overview requests such as "explain the attached document" select complete sentences in source order within the draft limit, including when generic words match only a heading. All selected content still passes local redaction and residual review. An empty context or an oversized sanitized draft fails preparation without creating an approvable workflow. `pages_used` reports pages contributing to the prepared context, tracked through redaction, rather than pages matching the model's initial keyword search. The provider is told that `Relevant context` contains extracted, privacy-filtered document text; it receives only the approved draft, never the attachment.
+
+### Local inference round trips
+
+The initial review now uses two model requests rather than three. Its first native `detect_sensitive_data` call requires both `terms` (1-8 bounded search terms) and `sensitive_spans`. The registry performs bound inspection, then validates and combines source spans with deterministic detection. All five internal operations still complete in order; the final residual audit remains a separate native call receiving only the sanitized draft. A single additional audit is permitted after verified redaction. Missing arguments, invalid source spans, repeated calls, and incomplete output still prevent approval. HTTP routes and review response fields are unchanged. The frontend allows 390 seconds for three bounded model calls plus orchestration.
+
+Backend-only `OLLAMA_KEEP_ALIVE_SECONDS` defaults to 900. The launcher enables content-free adapter diagnostics: stage durations, model load/prompt/generation durations, and token counts. No raw model output or document content is logged. The original audit instructions and reasoning budget are retained.

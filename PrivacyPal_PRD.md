@@ -2,6 +2,12 @@
 
 # Product Requirements Document
 
+> User-approved optional AWS demo (18 October 2026): fully host the UI, uploaded
+> document processing, and Gemma, using Lambda plus lower-cost CPU compute.
+> Disclose AWS processing in the hosted UI. Default local behavior and explicit
+> approval before sending to the answer provider remain. See
+> [the deployment runbook](deploy/aws/README.md).
+
 ## 1. Product Overview
 
 **Product Name:**

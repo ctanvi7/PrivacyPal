@@ -1,5 +1,9 @@
 import { ApiError, createApiClient } from './apiClient.js';
 
+// Combined inspection/detection, a separate audit, and at most one repair audit.
+// Allow three 120-second timeouts plus orchestration time.
+export const PRIVACY_ANALYSIS_TIMEOUT_MS = 390_000;
+
 function invalidResponse(message) {
   return new ApiError(message, { code: 'invalid_response', retryable: false });
 }
@@ -56,6 +60,19 @@ export function mapWorkflowResponse(value) {
   return Object.freeze({ ...response });
 }
 
+/** Validates the answer returned after a successful, backend-enforced approval. */
+export function mapApprovedWorkflowResponse(value) {
+  const response = requireObject(value, 'The local service returned an invalid approved response.');
+  requireText(response.workflow_id, 'The local service returned an invalid approved response.');
+  requireText(response.answer, 'The local service returned an invalid approved response.');
+  requireText(response.send_state, 'The local service returned an invalid approved response.');
+  if (!Number.isInteger(response.version) || !Array.isArray(response.pages_used) ||
+      !response.provider || typeof response.provider !== 'object' || Array.isArray(response.provider)) {
+    throw invalidResponse('The local service returned an invalid approved response.');
+  }
+  return Object.freeze({ ...response });
+}
+
 /** Contract-specific session, PDF upload, and local-analysis API. */
 export function createPrivacyPalApi({ client = createApiClient() } = {}) {
   return Object.freeze({
@@ -72,6 +89,25 @@ export function createPrivacyPalApi({ client = createApiClient() } = {}) {
       });
       return mapDocumentResponse(result);
     },
+    async removeDocument(sessionId, documentId, { signal } = {}) {
+      requireText(sessionId, 'An active session is required before removing a document.');
+      requireText(documentId, 'A document is required before it can be removed.');
+      const result = requireObject(await client.request(
+        `api/v1/sessions/${encodeURIComponent(sessionId)}/documents/${encodeURIComponent(documentId)}`,
+        { method: 'DELETE', signal },
+      ), 'The local service returned an invalid document removal response.');
+      if (result.status !== 'removed') throw invalidResponse('The local service returned an invalid document removal response.');
+      return Object.freeze({ ...result });
+    },
+    async clearSession(sessionId, { signal } = {}) {
+      requireText(sessionId, 'An active session is required before starting a new chat.');
+      const result = requireObject(await client.request(
+        `api/v1/sessions/${encodeURIComponent(sessionId)}/clear`,
+        { method: 'POST', signal },
+      ), 'The local service returned an invalid session clear response.');
+      if (result.status !== 'cleared') throw invalidResponse('The local service did not confirm that the session was cleared.');
+      return Object.freeze({ ...result });
+    },
     async submitQuestion(sessionId, documentId, question, { signal } = {}) {
       requireText(sessionId, 'An active session is required before asking a question.');
       requireText(documentId, 'A server-confirmed document is required before asking a question.');
@@ -80,9 +116,50 @@ export function createPrivacyPalApi({ client = createApiClient() } = {}) {
         method: 'POST',
         body: { document_id: documentId, question },
         signal,
-        timeoutMs: 130_000,
+        timeoutMs: PRIVACY_ANALYSIS_TIMEOUT_MS,
       });
       return mapWorkflowResponse(result);
+    },
+    async editWorkflowDraft(sessionId, workflowId, version, draft, { signal } = {}) {
+      requireText(sessionId, 'An active session is required before editing a review.');
+      requireText(workflowId, 'An active review is required before editing a draft.');
+      if (!Number.isInteger(version) || version < 1) throw new TypeError('A current review version is required.');
+      requireText(draft, 'The reviewed request cannot be empty.');
+      const result = await client.request(
+        `api/v1/sessions/${encodeURIComponent(sessionId)}/workflows/${encodeURIComponent(workflowId)}/draft`,
+        { method: 'PATCH', body: { version, draft }, signal, timeoutMs: 135_000 },
+      );
+      return mapWorkflowResponse(result);
+    },
+    async acknowledgeWorkflow(sessionId, workflowId, version, { signal } = {}) {
+      requireText(sessionId, 'An active session is required before acknowledging a review.');
+      requireText(workflowId, 'An active review is required before acknowledging it.');
+      if (!Number.isInteger(version) || version < 1) throw new TypeError('A current review version is required.');
+      const result = await client.request(
+        `api/v1/sessions/${encodeURIComponent(sessionId)}/workflows/${encodeURIComponent(workflowId)}/acknowledge`,
+        { method: 'POST', body: { version }, signal },
+      );
+      return mapWorkflowResponse(result);
+    },
+    async approveWorkflow(sessionId, workflowId, version, { signal } = {}) {
+      requireText(sessionId, 'An active session is required before approving a review.');
+      requireText(workflowId, 'An active review is required before approving it.');
+      if (!Number.isInteger(version) || version < 1) throw new TypeError('A current review version is required.');
+      const result = await client.request(
+        `api/v1/sessions/${encodeURIComponent(sessionId)}/workflows/${encodeURIComponent(workflowId)}/approve`,
+        { method: 'POST', body: { version, restore_placeholders: false }, signal, timeoutMs: 35_000 },
+      );
+      return mapApprovedWorkflowResponse(result);
+    },
+    async cancelWorkflow(sessionId, workflowId, { signal } = {}) {
+      requireText(sessionId, 'An active session is required before cancelling a review.');
+      requireText(workflowId, 'An active review is required before cancelling it.');
+      const result = requireObject(await client.request(
+        `api/v1/sessions/${encodeURIComponent(sessionId)}/workflows/${encodeURIComponent(workflowId)}/cancel`,
+        { method: 'POST', signal },
+      ), 'The local service returned an invalid cancellation response.');
+      if (result.status !== 'cancelled') throw invalidResponse('The local service returned an invalid cancellation response.');
+      return Object.freeze({ ...result });
     },
   });
 }
