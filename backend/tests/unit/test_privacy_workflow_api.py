@@ -507,7 +507,7 @@ def test_loaded_groq_settings_send_exact_reviewed_draft_and_return_answer(client
     real_client = httpx.AsyncClient
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs))
     session_id, review = start_workflow(client)
-    assert review["provider"] == {"name": "Groq", "endpoint": config.GROQ_BASE_URL, "configured": True}
+    assert review["provider"] == {"id": "default", "name": "Groq", "endpoint": config.GROQ_BASE_URL, "configured": True}
     assert "synthetic-key" not in json.dumps(review)
     assert sent == []
     response = client.post(

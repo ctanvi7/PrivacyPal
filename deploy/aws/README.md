@@ -161,3 +161,9 @@ cookie, authenticated UI/assets, Origin guard, ownership cookie, and synthetic
 PDF upload. The synthetic session was cleared. Twelve focused gateway tests
 also passed, including invalid credentials, expired/forged cookies, and keeping
 the gateway credential out of backend requests.
+
+### Optional Sarvam services
+
+Configure `SARVAM_API_KEY` securely in the backend runtime, with HTTPS egress to `api.sarvam.ai`; never place it in a frontend variable or deployment artifact. The backend loads `backend/.env` with process precedence. Restart the backend after configuration changes. The UI reports AWS processing and explicitly names Sarvam for each optional outbound translation/speech action.
+
+Audio uploads share the existing 4 MiB gateway request limit. WAV speech responses have a separate bounded 5 MiB JSON allowance, below the synchronous Lambda response envelope; ordinary responses remain limited to 512 KiB. Longer responses fail safely without retry or another provider. No deployment has been performed as part of this conflict resolution.

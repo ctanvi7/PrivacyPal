@@ -1,6 +1,6 @@
 # PrivacyPal backend
 
-This backend provides a loopback-only FastAPI service with in-memory sessions for PDF, PNG, JPEG, WebP, and pasted-text input. It performs document extraction and OCR locally, and uses Gemma through Ollama for local privacy analysis and sanitization. Users can review and edit the sanitized request before approval; only the exact approved draft is sent to a configured OpenAI-compatible answer provider. Source documents are not sent to that provider.
+This backend provides a loopback-only FastAPI service with in-memory sessions for PDF, PNG, JPEG, WebP, and pasted-text input. It performs document extraction and OCR locally, and uses Gemma through Ollama for local privacy analysis and sanitization. Users can select a configured answer provider, review and edit the sanitized request, and approve the exact draft before it is sent. Sarvam is also available for separately consented translation and speech features; those actions do not send source documents.
 
 PDF parsing uses `pypdf` in an isolated worker. Scanned PDF pages and PNG, JPEG, and WebP images use local Tesseract OCR. Gemma uses Ollama's native tool-call API to run bounded document inspection, deterministic sensitive-data checks, question-aware selection, draft construction, and residual-risk review. Initial limits are 10 MiB per upload, 25 PDF pages, 25,000 extracted characters, and a 15-second PDF parsing timeout. Encrypted, malformed, oversized, and unreadable documents are rejected.
 
@@ -19,6 +19,18 @@ Set `APP_HOST` to a loopback IP address and `APP_PORT` to an available port if t
 The default answer provider is Groq, with base URL `https://api.groq.com/openai/v1`. Set `ANSWER_PROVIDER_MODEL` to your chosen Groq model ID (no default model is assumed) and `ANSWER_PROVIDER_API_KEY`, or its fallback `GROQ_API_KEY`. Within the same source, the primary key wins; either process key overrides file credentials. Keep keys backend-only, out of `VITE_*` variables, source control, logs, and chat. Missing URL, model, or key leaves local analysis available and approval disabled. Invalid provider URLs fail startup safely.
 
 `ANSWER_PROVIDER_URL` accepts an HTTPS base URL or full `/chat/completions` endpoint; the adapter appends `/chat/completions` when needed. `ANSWER_PROVIDER_NAME` controls the name shown during review. The provider receives fixed grounding instructions plus one user message containing only the exact approved sanitized draft; it does not receive the original document, chat history, or placeholder mapping. Requests are not retried automatically.
+
+For Sarvam, use a separate hidden-key prompt in the backend PowerShell window:
+
+```powershell
+$secureSarvamKey = Read-Host "Sarvam API key" -AsSecureString
+$env:SARVAM_API_KEY = [System.Net.NetworkCredential]::new("", $secureSarvamKey).Password
+python backend/run.py
+```
+
+After stopping the backend, clear it with `Remove-Item Env:SARVAM_API_KEY`. The key stays in the backend process and is never returned to the browser.
+
+The standalone `sarvam_first_call.py` example uses Sarvam's Python SDK. Install the optional SDK dependency from the repository root with `python -m pip install -e ".\backend[sarvam]"`. The application itself uses its server-side HTTP adapter and does not require the SDK.
 
 ## Run locally
 

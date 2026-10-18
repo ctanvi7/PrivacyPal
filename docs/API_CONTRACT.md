@@ -259,7 +259,7 @@ The persistent schema is documented in DATABASE.md. SQLite history is not encryp
 
 The current FastAPI implementation uses these route names and fields (the proposal above remains useful as the behavioral contract):
 
-- `POST /api/v1/sessions/{session_id}/questions` runs Gemma's ordered local tools and returns `workflow_id`, `version`, the sanitized `draft`, safe `findings`, `residual_review`, and provider name/endpoint/configuration status. It does not contact the answer provider.
+- `POST /api/v1/sessions/{session_id}/questions` accepts optional `provider_id` (`default` or `sarvam`), binds that configured provider to the workflow, runs Gemma's ordered local tools, and returns `workflow_id`, `version`, the sanitized `draft`, safe `findings`, `residual_review`, and the selected provider name/endpoint/configuration status. It does not contact an answer provider.
 - `PATCH /api/v1/sessions/{session_id}/workflows/{workflow_id}/draft` accepts `{ "version": 1, "draft": "..." }`, increments the version, clears acknowledgement, and reruns local checks, including Gemma's contextual review.
 - `POST /api/v1/sessions/{session_id}/workflows/{workflow_id}/acknowledge` accepts the current version and records the user's acknowledgement of remaining non-blocking warnings.
 - `POST /api/v1/sessions/{session_id}/workflows/{workflow_id}/approve` accepts the current version and optional `restore_placeholders`; the backend consumes approval before making one provider call and returns the answer in that response.
@@ -311,3 +311,24 @@ Backend-only `OLLAMA_KEEP_ALIVE_SECONDS` defaults to 900. The launcher enables c
 ### Merge integration: completed requests and history
 
 Successful approval responses retain `history_saved` alongside the provider, pages, answer and consumed send state. Both credential scanning and answer grounding run before any restoration, response or history write. Withheld and uncertain answers are never saved. Completion releases source documents, semantic values, mappings and active review text; another question requires a new upload. Session creation returns a conversation ID and an HttpOnly ownership cookie. Session clear and conversation deletion invalidate pending analyses; a provider result already in flight cannot revive cleared state or create a new history entry. Groq model selection remains explicit, and process settings override `backend/.env`, including `PRIVACYPAL_DATABASE_PATH`.
+
+### Sarvam language and speech integration
+
+All routes remain behind the existing Origin/Host, session-ownership, and hosted-proxy checks. The subscription key stays on the backend. No caller can select an arbitrary remote host or provider model.
+
+| Route | Request | Result |
+| --- | --- | --- |
+| `GET /api/v1/providers` | none | Configured provider `items` with safe ID/name/endpoint metadata |
+| `POST /api/v1/sessions/{id}/questions` | existing fields plus optional `provider_id: "default"` or `"sarvam"` | Existing review response bound to the selected provider |
+| `POST /api/v1/sessions/{id}/workflows/{workflow}/translate-draft` | `{version, source_language, target_language, consent: true}` | `{workflow_id, version, translated_text, target_language, provider}` preview |
+| `POST /api/v1/sessions/{id}/speech/transcribe` | multipart `file` and `consent=true` | `{transcript, review_required: true}`; never submits a question |
+| `POST /api/v1/sessions/{id}/translate-answer` | `{text, source_language, target_language, consent: true}` | `{translated_text, target_language}` |
+| `POST /api/v1/sessions/{id}/speech/synthesize` | `{text, language, consent: true}` | `{audio_base64, content_type: "audio/wav"}` |
+
+Draft translation reads only the server-held current reviewed text. It repeats deterministic and source-identity checks before sending; unresolved warnings must first be acknowledged. Editing, approval, and duplicate draft translation cannot proceed while that translation is in flight. A cleared or replaced session/review invalidates the returned preview. Applying a translation uses the existing versioned draft PATCH route and repeats local checks; translation itself grants no approval.
+
+The provider ID is bound to the workflow, so changing client fields at approval cannot redirect a reviewed request. Sarvam chat receives the same fixed grounding instructions and exact approved user message as the existing provider. The existing one-use approval, no automatic retry, answer scan/grounding, and history rules apply.
+
+Only a SHA-256 digest of the successfully displayed answer is retained in active session state for subsequent language actions; its text must match exactly. The digest is invalidated on a new document/question, clear, expiry, or failure. Historical answers are not automatically authorized for resending. Translations and audio are temporary and are not added to persisted conversation history. Both translated output and provider answers are treated as untrusted text.
+
+Sarvam response bodies are bounded during streaming. Translation protects placeholder markers and rejects missing, duplicated, invented, or corrupted markers. TTS explicitly requests WAV and rejects invalid base64 or non-WAV output. The protected AWS gateway permits at most 5 MiB for the speech-response JSON, below its 6 MiB Lambda response envelope; other routes retain the 512 KiB limit. Audio uploads retain the gateway's existing 4 MiB limit.

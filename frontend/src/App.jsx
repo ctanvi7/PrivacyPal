@@ -6,6 +6,7 @@ import ReviewTimeline from './components/ReviewTimeline.js';
 import PrivacyChanges from './components/PrivacyChanges.js';
 import { getWorkflowStatus, performWorkflowAction } from './lib/workflowActions.js';
 import { createConversationHistoryController, groupConversationsByLocalDate } from './lib/conversationHistory.js';
+import { VoiceInput, AnswerTools } from './components/SarvamTools.jsx';
 import SafeMarkdown from './components/SafeMarkdown.js';
 import PrivacyReviewPanel from './components/PrivacyReviewPanel.jsx';
 import { CLOUD_HOSTED, processingCopy } from './lib/deployment.js';
@@ -90,8 +91,14 @@ function App() {
     uploadDocument: (sessionId, selectedFile, options) => privacyPalApi.uploadDocument(sessionId, selectedFile, options),
   }));
   const [uploadState, setUploadState] = useState(uploadController.getState);
+  const [providerOptions, setProviderOptions] = useState([]);
+  const [providerError, setProviderError] = useState('');
+  const [selectedProvider, setSelectedProvider] = useState('default');
+  const selectedProviderRef = useRef(selectedProvider);
+  selectedProviderRef.current = selectedProvider;
+  const [sarvamBusy, setSarvamBusy] = useState(false);
   const [questionController] = useState(() => createQuestionController({ timeoutMs: PRIVACY_ANALYSIS_TIMEOUT_MS + 5_000,
-    submitQuestion: (text, document, { signal, session }) => privacyPalApi.submitQuestion(session.session_id, document.document_id, text, { signal }),
+    submitQuestion: (text, document, { signal, session }) => privacyPalApi.submitQuestion(session.session_id, document.document_id, text, { signal, providerId: selectedProviderRef.current }),
   }));
   const [questionState, setQuestionState] = useState(questionController.getState);
   const [activeWorkflow, setActiveWorkflow] = useState(null);
@@ -106,6 +113,16 @@ function App() {
   useEffect(() => uploadController.subscribe(setUploadState), [uploadController]);
   useEffect(() => questionController.subscribe(setQuestionState), [questionController]);
   useEffect(() => { if (questionState.result) setActiveWorkflow(questionState.result); }, [questionState.result]);
+
+  useEffect(() => {
+    let active = true;
+    privacyPalApi.listProviders().then(({ items }) => {
+      if (!active) return;
+      setProviderOptions(items); setProviderError('');
+      if (items.length && !items.some(item => item.id === selectedProviderRef.current)) setSelectedProvider(items[0].id);
+    }).catch(() => { if (active) setProviderError('Answer-provider options could not be loaded. Local review remains available.'); });
+    return () => { active = false; };
+  }, []);
 
   useEffect(() => historyController.subscribe(setHistoryState), [historyController]);
   useEffect(() => { void historyController.load(); }, [historyController]);
@@ -126,7 +143,7 @@ function App() {
     return () => window.removeEventListener('keydown', handleShortcut);
   });
 
-  const navigationBusy = cleanupBusy || historyState.creating || uploadState.status === 'uploading' || questionState.status === 'processing' || workflowBusy;
+  const navigationBusy = sarvamBusy || cleanupBusy || historyState.creating || uploadState.status === 'uploading' || questionState.status === 'processing' || workflowBusy;
 
   async function clearActiveSession() {
     const sessionId = uploadController.getState().session?.session_id;
@@ -234,6 +251,17 @@ function App() {
       setWorkflow: setActiveWorkflow, setBusy: setWorkflowBusy, setError: setWorkflowError,
     });
   }
+  async function translateReviewedDraft(source, target) {
+    if (sarvamBusy || workflowBusy || !activeWorkflow) throw new Error('The review is busy or unavailable.');
+    setSarvamBusy(true);
+    try {
+      return await privacyPalApi.translateDraft(uploadState.session.session_id, activeWorkflow.workflow_id, activeWorkflow.version, source, target);
+    } finally { setSarvamBusy(false); }
+  }
+  async function useTranslatedDraft(text) {
+    const updated = await saveDraft(text);
+    if (updated) setNotice('Translation saved and rechecked. Review the exact new request before approval.');
+  }
   function saveDraft(draft) {
     return runWorkflowAction((sid, workflowId, version) => privacyPalApi.editWorkflowDraft(sid, workflowId, version, draft));
   }
@@ -259,6 +287,7 @@ function App() {
   const currentAnswerSaved = activeWorkflow?.send_state === 'sent' && activeWorkflow.history_saved && savedMessages.at(-1)?.content === activeWorkflow.answer && savedMessages.at(-2)?.content === activeWorkflow.question;
   const priorMessages = currentAnswerSaved ? savedMessages.slice(0, -2) : savedMessages;
   const sourceConsumed = Boolean(activeWorkflow && ['sent', 'delivery_unknown', 'answer_withheld', 'cancelled'].includes(activeWorkflow.send_state));
+  const sarvamAvailable = providerOptions.some(provider => provider.id === 'sarvam');
   const workflowStatus = activeWorkflow ? getWorkflowStatus(activeWorkflow) : null;
   const questionFailed = questionState.status === 'processing-error';
   const findings = activeWorkflow?.findings || [];
@@ -268,7 +297,7 @@ function App() {
   return <main className="workspace" data-upload-state={uploadState.status} data-question-state={questionState.status}>
     <aside id="conversation-sidebar" className={`sidebar glass-panel ${mobileHistoryOpen ? 'mobile-open' : ''}`} aria-label="Conversation navigation">
       <a className="brand" href="#home" onClick={event => { event.preventDefault(); startNewChat(); }} aria-label="PrivacyPal home"><span className="brand-mark"><PrivacyPalLogo size={40}/></span><span><strong>PrivacyPal</strong><small>{CLOUD_HOSTED ? 'Your private AWS workspace.' : 'Your data stays with you.'}</small></span></a>
-      <button className="new-chat" type="button" onClick={startNewChat} disabled={cleanupBusy || uploadState.status === 'uploading' || questionState.status === 'processing' || workflowBusy}><span className="plus-disc"><Icon name="plus" size={20}/></span><b>New chat</b><kbd>Ctrl N</kbd></button>
+      <button className="new-chat" type="button" onClick={startNewChat} disabled={navigationBusy}><span className="plus-disc"><Icon name="plus" size={20}/></span><b>New chat</b><kbd>Ctrl N</kbd></button>
       <nav className="recent-list" aria-label="Conversation navigation">
         {historyState.status === 'loading' && <p className="recent-empty" role="status">Loading saved conversations…</p>}
         {historyState.status === 'error' && <div className="recent-empty" role="alert">{historyState.error} <button type="button" onClick={() => void historyController.refresh()}>Retry</button></div>}
@@ -300,14 +329,17 @@ function App() {
         </> : file ? <>
           {historyState.detailStatus === 'ready' && historyState.detail?.conversation_id === uploadState.session?.conversation_id && <SavedMessages messages={priorMessages}/>}
 
-          <div className="user-row"><div className="user-message"><p>{question || (uploadState.status === 'uploaded' ? 'Document ready for a question' : uploadState.status === 'uploading' ? 'Uploading document' : 'Document selected')}</p><FileChip file={file} uploadResult={uploadState.uploadedDocument} uploaded={uploadState.status === 'uploaded'} onRemove={removeDocument} disabled={cleanupBusy || uploadState.status === 'uploading' || questionState.status === 'processing' || workflowBusy}/></div><span className="user-avatar" aria-hidden="true"><span/></span></div>
-          {activeWorkflow ? <><div className="assistant-row"><ShieldMark className="assistant-avatar"/><div className="assistant-message"><p>{activeWorkflow.review_complete ? processingCopy('Local review complete.') : activeWorkflow.residual_review?.status === 'blocked' ? processingCopy('Local review needs attention.') : processingCopy('Local review is incomplete.')}</p><p>{activeWorkflow.send_state === 'review' ? 'Review the exact request before deciding whether to get an answer.' : workflowStatus.detail}</p></div></div><PrivacyReviewPanel response={activeWorkflow} busy={workflowBusy} error={workflowError} onEdit={saveDraft} onAcknowledge={acknowledgeWarnings} onApprove={approveWorkflow} onCancel={cancelReview}/></> : <div className="pending-card glass-panel"><span className="pending-icon"><Icon name="lock" size={22}/></span><div><h2>{questionFailed ? 'Privacy review needs attention' : uploadState.status === 'uploading' ? processingCopy('Reading document locally') : uploadState.status === 'upload-error' || uploadState.status === 'cancelled' ? 'Upload needs attention' : questionState.status === 'processing' ? processingCopy('Checking your question locally') : 'Ready for your question'}</h2><p>{questionFailed ? 'The review stopped before a draft was ready. Check the failed step and retry below.' : uploadState.status === 'uploading' ? processingCopy('The local service is processing the selected file.') : uploadState.status === 'uploaded' ? processingCopy('Ask a question to run the local privacy review. Nothing is sent to an answer provider at this stage.') : uploadState.error?.message || 'The selected file remains local until the service confirms a successful upload.'}</p>{uploadState.status === 'uploading' && <button className="edit-button" type="button" onClick={() => uploadController.cancel()}>Cancel upload</button>}{uploadState.error?.retryable && <button className="edit-button" type="button" onClick={() => uploadController.retry()}>Retry upload</button>}</div></div>}
+          <div className="user-row"><div className="user-message"><p>{question || (uploadState.status === 'uploaded' ? 'Document ready for a question' : uploadState.status === 'uploading' ? 'Uploading document' : 'Document selected')}</p><FileChip file={file} uploadResult={uploadState.uploadedDocument} uploaded={uploadState.status === 'uploaded'} onRemove={removeDocument} disabled={navigationBusy}/></div><span className="user-avatar" aria-hidden="true"><span/></span></div>
+          {activeWorkflow ? <><div className="assistant-row"><ShieldMark className="assistant-avatar"/><div className="assistant-message"><p>{activeWorkflow.review_complete ? processingCopy('Local review complete.') : activeWorkflow.residual_review?.status === 'blocked' ? processingCopy('Local review needs attention.') : processingCopy('Local review is incomplete.')}</p><p>{activeWorkflow.send_state === 'review' ? 'Review the exact request before deciding whether to get an answer.' : workflowStatus.detail}</p></div></div><PrivacyReviewPanel key={`${activeWorkflow.workflow_id}:${activeWorkflow.version}`} response={activeWorkflow} busy={workflowBusy || sarvamBusy} sarvamAvailable={sarvamAvailable} onTranslate={translateReviewedDraft} onUseTranslation={useTranslatedDraft} error={workflowError} onEdit={saveDraft} onAcknowledge={acknowledgeWarnings} onApprove={approveWorkflow} onCancel={cancelReview}/>{sarvamAvailable && activeWorkflow.send_state === 'sent' && activeWorkflow.answer && <AnswerTools key={activeWorkflow.workflow_id} sessionId={uploadState.session.session_id} answer={activeWorkflow.answer} onBusyChange={setSarvamBusy}/>}</> : <div className="pending-card glass-panel"><span className="pending-icon"><Icon name="lock" size={22}/></span><div><h2>{questionFailed ? 'Privacy review needs attention' : uploadState.status === 'uploading' ? processingCopy('Reading document locally') : uploadState.status === 'upload-error' || uploadState.status === 'cancelled' ? 'Upload needs attention' : questionState.status === 'processing' ? processingCopy('Checking your question locally') : 'Ready for your question'}</h2><p>{questionFailed ? 'The review stopped before a draft was ready. Check the failed step and retry below.' : uploadState.status === 'uploading' ? processingCopy('The local service is processing the selected file.') : uploadState.status === 'uploaded' ? processingCopy('Ask a question to run the local privacy review. Nothing is sent to an answer provider at this stage.') : uploadState.error?.message || 'The selected file remains local until the service confirms a successful upload.'}</p>{uploadState.status === 'uploading' && <button className="edit-button" type="button" onClick={() => uploadController.cancel()}>Cancel upload</button>}{uploadState.error?.retryable && <button className="edit-button" type="button" onClick={() => uploadController.retry()}>Retry upload</button>}</div></div>}
         </> : <EmptyConversation onChoose={() => fileInput.current?.click()}/>}
         {questionState.status === 'processing' && <div className="notice" role="status">{processingCopy('Local privacy analysis is in progress.')} <button type="button" onClick={() => { questionController.cancel(); setNotice('Question submission cancelled.'); }}>Cancel</button></div>}
         {questionState.status === 'processing-error' && questionState.error?.retryable && uploadState.uploadedDocument && <div className="notice" role="status">{questionState.error.message} <button type="button" onClick={retryQuestion}>Retry question</button></div>}
         {notice && !(questionFailed && notice === questionState.error?.message && questionState.error?.retryable) && <p className="notice" role="status">{notice}</p>}
       </div>
 
+      {providerOptions.length > 0 && <div className="provider-choice"><label htmlFor="answer-provider">Answer provider</label><select id="answer-provider" value={selectedProvider} disabled={navigationBusy || Boolean(activeWorkflow)} onChange={e => setSelectedProvider(e.target.value)}>{providerOptions.map(provider => <option key={provider.id} value={provider.id}>{provider.name}</option>)}</select><span>Only the exact reviewed request goes to this provider after approval.</span></div>}
+      {providerError && <p role="status">{providerError}</p>}
+      {sarvamAvailable && uploadState.session && !sourceConsumed && <VoiceInput key={uploadState.session.session_id} sessionId={uploadState.session.session_id} onBusyChange={setSarvamBusy} disabled={workflowBusy || cleanupBusy || questionState.status === 'processing' || Boolean(activeWorkflow)} onTranscript={text => { setQuestion(text); questionController.setQuestion(text); setNotice('Transcript ready. Review or edit it before submitting your question.'); }}/>}
       <form className="composer glass-panel" onSubmit={submitQuestion}><input ref={fileInput} className="visually-hidden" type="file" accept="application/pdf,image/png,image/jpeg,image/webp" aria-label="Choose a document" onChange={event => selectDocument(event.target.files?.[0])}/><button className="attach-button" type="button" aria-label="Attach a document" onClick={() => fileInput.current?.click()} disabled={navigationBusy}><Icon name="attach" size={20}/></button><label className="visually-hidden" htmlFor="question">Ask a question about your document</label><textarea id="question" value={question} onChange={event => { setQuestion(event.target.value); questionController.setQuestion(event.target.value); if (notice) setNotice(''); }} placeholder={file ? 'Ask a question about this document?' : 'Choose a document to start a private chat...'} rows="1" disabled={!file || sourceConsumed || navigationBusy || uploadState.status !== 'uploaded'}/><button className="send-button" type="submit" aria-label="Submit question" disabled={!file || sourceConsumed || navigationBusy || uploadState.status !== 'uploaded' || !question.trim()}><Icon name="send" size={19}/></button></form>
     </section>
 

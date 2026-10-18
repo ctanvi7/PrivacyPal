@@ -36,6 +36,11 @@ class Settings:
     answer_provider_model: str = ""
     answer_provider_api_key: str = field(default="", repr=False)
     answer_provider_timeout_seconds: float = 30.0
+    sarvam_api_key: str = field(default="", repr=False)
+    sarvam_chat_model: str = "sarvam-105b"
+    sarvam_translation_model: str = "sarvam-translate:v1"
+    sarvam_tts_model: str = "bulbul:v4-flash"
+    sarvam_timeout_seconds: float = 45.0
     database_path: str = ""
 
 
@@ -155,5 +160,10 @@ def get_settings() -> Settings:
         answer_provider_model=provider_model,
         answer_provider_api_key=provider_api_key,
         answer_provider_timeout_seconds=_positive_float(env, "ANSWER_PROVIDER_TIMEOUT_SECONDS", 30.0),
+        sarvam_api_key=env.get("SARVAM_API_KEY", "").strip(),
+        sarvam_chat_model=env.get("SARVAM_CHAT_MODEL", "sarvam-105b").strip() or "sarvam-105b",
+        sarvam_translation_model=env.get("SARVAM_TRANSLATION_MODEL", "sarvam-translate:v1").strip() or "sarvam-translate:v1",
+        sarvam_tts_model=env.get("SARVAM_TTS_MODEL", "bulbul:v4-flash").strip() or "bulbul:v4-flash",
+        sarvam_timeout_seconds=_positive_float(env, "SARVAM_TIMEOUT_SECONDS", 45.0),
         database_path=str(database_path),
     )

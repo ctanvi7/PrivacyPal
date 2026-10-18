@@ -117,3 +117,19 @@ def test_database_path_uses_same_file_and_process_precedence_as_provider(env_fil
     assert config.get_settings().database_path == str(file_path)
     monkeypatch.setenv("PRIVACYPAL_DATABASE_PATH", str(process_path))
     assert config.get_settings().database_path == str(process_path)
+
+
+def test_sarvam_settings_load_from_backend_file_with_process_precedence(env_file, monkeypatch):
+    env_file.write_text("SARVAM_API_KEY=fixture-file-key\nSARVAM_CHAT_MODEL=file-model\nSARVAM_TIMEOUT_SECONDS=50\n")
+    settings = config.get_settings()
+    assert settings.sarvam_api_key == "fixture-file-key"
+    assert settings.sarvam_chat_model == "file-model"
+    assert settings.sarvam_timeout_seconds == 50
+    assert "fixture-file-key" not in repr(settings)
+    monkeypatch.setenv("SARVAM_API_KEY", "fixture-process-key")
+    monkeypatch.setenv("SARVAM_CHAT_MODEL", "process-model")
+    assert config.get_settings().sarvam_api_key == "fixture-process-key"
+    assert config.get_settings().sarvam_chat_model == "process-model"
+    monkeypatch.setenv("SARVAM_TIMEOUT_SECONDS", "0")
+    with pytest.raises(ValueError, match="SARVAM_TIMEOUT_SECONDS"):
+        config.get_settings()

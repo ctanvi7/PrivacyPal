@@ -35,3 +35,7 @@ npm.cmd run build
 ## Next integration milestone
 
 The backend also currently implements workflow draft editing, acknowledgement, approval, and answer delivery routes. Those are intentionally not connected by this prompt. They need a separate integration step and tests before the UI offers those operations. The root `docs/API_CONTRACT.md` is still labeled a draft and contains older route examples; use the actual route implementations in `backend/app/main.py` as the source of truth.
+
+## Sarvam language and speech
+
+The current UI preserves the liquid-glass review, per-stage privacy status, and saved-history navigation. With a backend `SARVAM_API_KEY`, it also offers a provider selector, optional voice dictation/audio transcription, a separately consented draft-translation preview with rechecking, and translation/read-aloud tools for the returned answer. Keys are never frontend configuration. See `LOCAL_SETUP.md` for limits, consent, models, and setup.

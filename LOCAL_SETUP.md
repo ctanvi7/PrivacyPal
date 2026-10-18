@@ -1,6 +1,6 @@
 # Run the local document flow
 
-PrivacyPal supports document upload or pasted text, local extraction/OCR, Gemma-guided local privacy checks, a sanitized-request review and approval gate, and an optional OpenAI-compatible answer provider. No external request is made until the current draft passes required checks and the user approves it.
+PrivacyPal supports document upload or pasted text, local extraction/OCR, Gemma-guided local privacy checks, a sanitized-request review and approval gate, and selectable configured answer providers including optional Sarvam. Sarvam translation and speech features are separate opt-in actions. No answer request is made until the current draft passes required checks and the user approves it.
 
 ## Requirements
 
@@ -90,3 +90,16 @@ Local inference keeps the configured Gemma model loaded for 900 seconds after ea
 For an optional local performance check with synthetic data only, run `python backend/scripts/benchmark_local_inference.py`. Add `--audit` to check masked content, exposed identity values, contextual identity clues, and embedded instructions. `--baseline backups/<your-backup>.zip` runs the archived adapter/registry from a trusted local source backup without overwriting working files. These checks contact only local Ollama and never invoke the answer provider; normal automated tests use mocks. Timings depend on CPU load, prompt caching, and whether model weights are already loaded.
 
 In the local Gemma smoke check, masked content and an exposed name were handled correctly, but the unchanged final audit missed the `contextual_clue` fixture about a person being the only member of a particular role. `--audit` deliberately exits nonzero on that miss. This is a model detection limitation; fewer model requests do not establish exhaustive privacy detection.
+
+## Optional Sarvam language and speech
+
+Set `SARVAM_API_KEY` privately in `backend/.env` or the backend process environment, then restart the backend and reload the frontend. Process values override the file. Keep the key out of `VITE_*` variables. Allow HTTPS egress to `api.sarvam.ai` in restricted environments. No Sarvam SDK is needed by the app.
+
+Defaults are `SARVAM_CHAT_MODEL=sarvam-105b`, `SARVAM_TRANSLATION_MODEL=sarvam-translate:v1`, `SARVAM_TTS_MODEL=bulbul:v4-flash`, and `SARVAM_TIMEOUT_SECONDS=45`. The model settings can be changed by the server operator. Sarvam appears in the answer-provider selector only when configured; existing Groq configuration continues to work independently.
+
+- Choose an answer provider before submitting the question. The review displays the bound provider and endpoint; approval sends only the exact reviewed text.
+- Expand **Dictate a question** after upload. Record locally or choose an audio file, then explicitly consent and transcribe. Review the resulting question before submitting it. Microphone recordings stop after 30 seconds. Audio files are limited to 10 MiB locally and 4 MiB through the AWS gateway; service format/duration restrictions still apply.
+- **Translate reviewed request** sends the exact sanitized request to Sarvam only after separate consent and completed/acknowledged privacy checks. The preview changes nothing until **Use translation and rerun privacy checks** is selected. Review the new version before approval.
+- After a checked answer returns, **Translate or listen** offers independently consented answer translation and WAV speech. These actions accept only the exact answer returned in the active session. Translation supports up to 2,000 characters; speech supports up to 2,500. Applying a request translation reruns Gemma checks, so a live local model is still required.
+
+Microphone access needs a secure browser context (HTTPS or localhost). If recording is unavailable or denied, choose an audio file instead. No language service silently falls back to another provider. Multilingual privacy detection remains conservative and non-exhaustive; a translation is not evidence of anonymity.

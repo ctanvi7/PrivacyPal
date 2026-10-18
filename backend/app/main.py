@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import hashlib
 import hmac
 import threading
 import time
@@ -11,7 +12,7 @@ from typing import Literal
 from urllib.parse import urlparse
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile as FastAPIUploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -45,6 +46,8 @@ from app.provider.answer_provider import (
     ApprovedRequest,
     OpenAICompatibleProvider,
 )
+from app.provider.sarvam import MAX_AUDIO_BYTES, MAX_TTS_CHARS, MAX_TRANSLATION_CHARS, SarvamClient
+from app.provider.answer_provider import ProviderError
 from app.tools.registry import (
     ToolContext,
     ToolRegistry,
@@ -92,6 +95,8 @@ class PrivacyWorkflow:
     draft: str
     findings: tuple[Finding, ...]
     placeholder_map: dict[str, str] = field(repr=False)
+    provider_id: str = "default"
+    language_busy: bool = False
     residual: ResidualReview | None = None
     contextual_flags: tuple[str, ...] = ()
     semantic_values: tuple[str, ...] | None = field(default=None, repr=False)
@@ -115,6 +120,7 @@ class Session:
     touched_at: float = 0.0
     requests: dict[str, "ReviewRequest"] | None = None
     status: Literal["active", "clearing", "expired"] = "active"
+    answer_digest: str | None = field(default=None, repr=False)
     conversation_id: str | None = None
     analysis_id: str | None = None
     lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
@@ -143,6 +149,28 @@ class PastedText(BaseModel):
 class Question(BaseModel):
     document_id: str = Field(min_length=1, max_length=80)
     question: str = Field(min_length=1, max_length=MAX_QUESTION_CHARS)
+    provider_id: Literal["default", "sarvam"] = "default"
+
+
+class TranslationRequest(BaseModel):
+    # Explicit confirmation is required for every outbound translation operation.
+    consent: bool
+    source_language: str = Field(min_length=2, max_length=12)
+    target_language: str = Field(min_length=2, max_length=12)
+    version: int = Field(ge=1)
+
+
+class SpeechOutputRequest(BaseModel):
+    consent: bool
+    text: str = Field(min_length=1, max_length=MAX_TTS_CHARS)
+    language: str = Field(min_length=2, max_length=12)
+
+
+class AnswerTranslationRequest(BaseModel):
+    consent: bool
+    text: str = Field(min_length=1, max_length=MAX_TRANSLATION_CHARS)
+    source_language: str = Field(min_length=2, max_length=12)
+    target_language: str = Field(min_length=2, max_length=12)
 
 
 class SessionCreate(BaseModel):
@@ -384,8 +412,19 @@ def _map_extraction_error(error: ExtractionError) -> JSONResponse:
     return _error(422, "INVALID_PDF", "The document is malformed or unreadable.")
 
 
-def _provider_view() -> dict[str, object]:
+def _provider_view(provider_id: str = "default") -> dict[str, object]:
+    if provider_id == "sarvam":
+        return {
+            "id": "sarvam",
+            "name": "Sarvam AI",
+            "endpoint": "https://api.sarvam.ai/v1/chat/completions",
+            "configured": bool(settings.sarvam_api_key),
+            "model": settings.sarvam_chat_model,
+        }
+    if provider_id != "default":
+        return {"id": provider_id, "name": "Unavailable provider", "endpoint": "", "configured": False}
     return {
+        "id": "default",
         "name": settings.answer_provider_name,
         "endpoint": settings.answer_provider_url,
         "configured": bool(
@@ -417,7 +456,7 @@ def _workflow_view(workflow: PrivacyWorkflow) -> dict[str, object]:
         "local_checks": dict(workflow.local_checks),
         "acknowledged": workflow.acknowledged,
         "send_state": workflow.send_state,
-        "provider": _provider_view(),
+        "provider": _provider_view(workflow.provider_id),
         "pages_used": list(workflow.pages_used),
     }
 
@@ -441,10 +480,12 @@ def _get_workflow(
     return session, workflow
 
 
-def _discard_sensitive_active_content(session: Session) -> None:
+def _discard_sensitive_active_content(session: Session, *, preserve_answer_digest: bool = False) -> None:
     """Release document/workflow content while retaining only retry-safe status IDs."""
     session.document = None
     session.document_id = None
+    if not preserve_answer_digest:
+        session.answer_digest = None
     if session.requests is not None:
         session.requests.clear()
     workflow = session.workflow
@@ -461,9 +502,38 @@ def _discard_sensitive_active_content(session: Session) -> None:
         workflow.pages_used = ()
 
 
+def _verify_last_answer(session: Session, text: str) -> None:
+    expected = session.answer_digest
+    received = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    if not expected or not hmac.compare_digest(expected, received):
+        raise HTTPException(status_code=409, detail="Only the answer returned in this active session can be sent to Sarvam.")
+
+
 @app.get("/health", tags=["health"])
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/api/v1/providers")
+def list_answer_providers() -> dict[str, object]:
+    options = [_provider_view("default"), _provider_view("sarvam")]
+    return {"items": [item for item in options if item["configured"]]}
+
+
+def _sarvam_client() -> SarvamClient:
+    if not settings.sarvam_api_key:
+        raise HTTPException(status_code=503, detail="Sarvam is not configured on this computer.")
+    return SarvamClient(settings.sarvam_api_key, settings.sarvam_timeout_seconds)
+
+
+TRANSLATION_LANGUAGES = {"en-IN", "hi-IN", "bn-IN", "ta-IN", "te-IN", "mr-IN", "gu-IN", "kn-IN", "ml-IN", "pa-IN", "od-IN", "as-IN", "ur-IN", "brx-IN", "doi-IN", "kok-IN", "ks-IN", "mai-IN", "mni-IN", "ne-IN", "sa-IN", "sat-IN", "sd-IN"}
+SPEECH_LANGUAGES = {"en-IN", "hi-IN", "bn-IN", "ta-IN", "te-IN", "mr-IN", "gu-IN", "kn-IN", "ml-IN", "pa-IN", "od-IN"}
+
+
+def _validate_language(language: str, *, speech: bool = False) -> None:
+    supported = SPEECH_LANGUAGES if speech else TRANSLATION_LANGUAGES
+    if language not in supported:
+        raise HTTPException(status_code=422, detail="Choose a supported Sarvam language.")
 
 
 @app.post("/api/v1/sessions", status_code=201)
@@ -637,6 +707,7 @@ async def attach_document(session_id: str, request: Request) -> JSONResponse:
             raise HTTPException(status_code=409, detail="The session was cleared while the document was processing.")
         session.document_id = document_id
         session.document = document
+        session.answer_digest = None
         session.workflow = None
     character_count = len(document.text)
     return JSONResponse(
@@ -661,6 +732,8 @@ async def ask_question(session_id: str, payload: Question) -> dict[str, object]:
             status_code=422,
             detail="Enter a question about the document.",
         )
+    if payload.provider_id == "sarvam" and not settings.sarvam_api_key:
+        raise HTTPException(status_code=503, detail="Sarvam is not configured on this computer.")
     analysis_id = str(uuid4())
     with sessions.lock, session.lock:
         if sessions.items.get(session_id) is not session or session.status != "active":
@@ -671,6 +744,7 @@ async def ask_question(session_id: str, payload: Question) -> dict[str, object]:
             raise HTTPException(status_code=409, detail="Add a document before asking a question.")
         doc_id = session.document_id
         document = session.document
+        session.answer_digest = None
         session.analysis_id = analysis_id
         session.workflow = None
     context = ToolContext(
@@ -738,6 +812,7 @@ async def ask_question(session_id: str, payload: Question) -> dict[str, object]:
             question=question,
             draft=context.draft.text,
             findings=context.draft.findings,
+            provider_id=payload.provider_id,
             placeholder_map=dict(context.draft.placeholder_map),
             residual=context.residual_review,
             review_complete=context.residual_review.status != "blocked",
@@ -773,7 +848,7 @@ async def edit_draft(
     with sessions.lock, session.lock, workflow.lock:
         if sessions.items.get(session_id) is not session or session.status != "active" or session.workflow is not workflow:
             raise HTTPException(status_code=409, detail="The session or review is no longer active.")
-        if payload.version != workflow.version or workflow.send_state != "review":
+        if payload.version != workflow.version or workflow.send_state != "review" or workflow.language_busy:
             raise HTTPException(status_code=409, detail="This review changed or is no longer editable. Reload it before continuing.")
     text = payload.draft.strip()
     if not text:
@@ -782,7 +857,7 @@ async def edit_draft(
             detail="The reviewed request cannot be empty.",
         )
     with workflow.lock:
-        if payload.version != workflow.version or workflow.send_state != "review":
+        if payload.version != workflow.version or workflow.send_state != "review" or workflow.language_busy:
             raise HTTPException(status_code=409, detail="This review changed or is no longer editable. Reload it before continuing.")
         workflow.version += 1
         target_version = workflow.version
@@ -858,7 +933,7 @@ async def acknowledge_review(
 ) -> dict[str, object]:
     _, workflow = _get_workflow(session_id, workflow_id)
     with workflow.lock:
-        if payload.version != workflow.version or workflow.send_state != "review":
+        if payload.version != workflow.version or workflow.send_state != "review" or workflow.language_busy:
             raise HTTPException(status_code=409, detail="This review changed. Check the latest version before acknowledging it.")
         if not workflow.review_complete or workflow.residual is None or workflow.residual.status == "blocked":
             raise HTTPException(status_code=409, detail="The required privacy checks have not completed, or a high-risk value is blocked.")
@@ -878,9 +953,10 @@ async def approve_and_send(
     with sessions.lock, session.lock, workflow.lock:
         if sessions.items.get(session_id) is not session or session.status != "active" or session.workflow is not workflow:
             raise HTTPException(status_code=409, detail="The session or review is no longer active.")
-        if payload.version != workflow.version or workflow.send_state != "review":
+        if payload.version != workflow.version or workflow.send_state != "review" or workflow.language_busy:
             raise HTTPException(status_code=409, detail="This approval is stale, already used, or no longer active.")
-        if not _provider_view()["configured"]:
+        provider_view = _provider_view(workflow.provider_id)
+        if not provider_view["configured"]:
             raise HTTPException(status_code=503, detail="Configure the answer provider in the backend environment before approving a send.")
         if not workflow.review_complete or workflow.residual is None or workflow.residual.status == "blocked":
             raise HTTPException(status_code=409, detail="The privacy checks are incomplete or a high-risk value remains.")
@@ -913,18 +989,20 @@ async def approve_and_send(
         approved = ApprovedRequest(
             workflow_id=workflow.workflow_id,
             version=workflow.version,
-            provider_name=settings.answer_provider_name,
-            provider_url=settings.answer_provider_url,
+            provider_name=str(provider_view["name"]),
+            provider_url=str(provider_view["endpoint"]),
             content=workflow.draft,
         )
-    provider = OpenAICompatibleProvider(
-        url=settings.answer_provider_url,
-        model=settings.answer_provider_model,
-        api_key=settings.answer_provider_api_key,
-        timeout_seconds=settings.answer_provider_timeout_seconds,
-    )
     try:
-        answer = await provider.send(approved)
+        if workflow.provider_id == "sarvam":
+            answer = await _sarvam_client().chat(model=settings.sarvam_chat_model, content=approved.content)
+        else:
+            provider = OpenAICompatibleProvider(
+                url=settings.answer_provider_url, model=settings.answer_provider_model,
+                api_key=settings.answer_provider_api_key,
+                timeout_seconds=settings.answer_provider_timeout_seconds,
+            )
+            answer = await provider.send(approved)
     except Exception as exc:
         workflow.send_state = "delivery_unknown"
         _discard_sensitive_active_content(session)
@@ -978,13 +1056,155 @@ async def approve_and_send(
             "workflow_id": workflow.workflow_id,
             "version": workflow.version,
             "answer": answer,
-            "provider": _provider_view(),
+            "provider": _provider_view(workflow.provider_id),
             "pages_used": list(workflow.pages_used),
             "send_state": workflow.send_state,
             "history_saved": history_saved,
         }
-        _discard_sensitive_active_content(session)
+        if sessions.is_active(session_id, session):
+            session.answer_digest = hashlib.sha256(answer.encode("utf-8")).hexdigest()
+        _discard_sensitive_active_content(session, preserve_answer_digest=True)
         return response
+
+
+@app.post("/api/v1/sessions/{session_id}/workflows/{workflow_id}/translate-draft")
+async def translate_approved_draft(session_id: str, workflow_id: str, payload: TranslationRequest) -> dict[str, object]:
+    session, workflow = _get_workflow(session_id, workflow_id)
+    if not payload.consent:
+        raise HTTPException(status_code=403, detail="Confirm before sending the reviewed request to Sarvam for translation.")
+    _validate_language(payload.source_language)
+    _validate_language(payload.target_language)
+    client = _sarvam_client()
+    with sessions.lock, session.lock, workflow.lock:
+        if not sessions.is_active(session_id, session) or session.workflow is not workflow:
+            raise HTTPException(status_code=409, detail="This review is no longer active.")
+        if payload.version != workflow.version or workflow.send_state != "review" or workflow.language_busy:
+            raise HTTPException(status_code=409, detail="This reviewed request changed or is busy. Review the current version before translating.")
+        if not workflow.review_complete or workflow.residual is None or workflow.residual.status == "blocked":
+            raise HTTPException(status_code=409, detail="The privacy review must complete before translation.")
+        if workflow.residual.status == "needs_review" and not workflow.acknowledged:
+            raise HTTPException(status_code=409, detail="Acknowledge remaining privacy warnings before translation.")
+        text = workflow.draft
+        if len(text) > MAX_TRANSLATION_CHARS:
+            raise HTTPException(status_code=413, detail="The reviewed request exceeds the 2,000-character translation limit.")
+        try:
+            scan = scan_sensitive_data(text)
+            if session.document is None:
+                raise PrivacyCheckError("Source review is unavailable.")
+            identity = review_outbound_identity(text, session.document.text, workflow.question, workflow.residual,
+                                               known_values=workflow.semantic_values)
+            if identity.status == "blocked" or any(item.action == "block" for item in scan.findings):
+                raise PrivacyCheckError("An identifying value remains.")
+        except PrivacyCheckError as exc:
+            raise HTTPException(status_code=409, detail="The final privacy check failed; edit and recheck before translation.") from exc
+        workflow.language_busy = True
+    try:
+        translated = await client.translate(text, source_language=payload.source_language,
+                                            target_language=payload.target_language, model=settings.sarvam_translation_model)
+        with sessions.lock, session.lock, workflow.lock:
+            if not sessions.is_active(session_id, session) or session.workflow is not workflow or workflow.version != payload.version:
+                raise HTTPException(status_code=409, detail="This session or review changed during translation.")
+            result_scan = scan_sensitive_data(translated)
+            identity = review_outbound_identity(translated, session.document.text, workflow.question, workflow.residual,
+                                               known_values=workflow.semantic_values)
+            if identity.status == "blocked" or any(item.action == "block" for item in result_scan.findings):
+                raise HTTPException(status_code=502, detail="The translated draft failed privacy checks and was withheld.")
+        return {"workflow_id": workflow_id, "version": payload.version, "target_language": payload.target_language,
+                "translated_text": translated, "provider": "Sarvam AI"}
+    except HTTPException:
+        raise
+    except (ProviderError, PrivacyCheckError) as exc:
+        raise HTTPException(status_code=502, detail="Translation could not be safely completed. No fallback provider was used.") from exc
+    finally:
+        with workflow.lock:
+            workflow.language_busy = False
+
+
+@app.post("/api/v1/sessions/{session_id}/speech/transcribe")
+async def transcribe_speech(
+    session_id: str,
+    consent: bool = Form(...),
+    file: FastAPIUploadFile = File(...),
+) -> dict[str, object]:
+    session = sessions.get(session_id)
+    if not consent:
+        raise HTTPException(status_code=403, detail="Confirm before sending audio to Sarvam for transcription.")
+    audio = await file.read(MAX_AUDIO_BYTES + 1)
+    await file.close()
+    if len(audio) > MAX_AUDIO_BYTES:
+        raise HTTPException(status_code=413, detail="Choose an audio file up to 10 MiB.")
+    mime = file.content_type or ""
+    extension = {
+        "audio/wav": "wav", "audio/x-wav": "wav", "audio/mpeg": "mp3", "audio/mp3": "mp3",
+        "audio/aac": "aac", "audio/flac": "flac", "audio/ogg": "ogg", "audio/opus": "opus",
+        "audio/webm": "webm", "audio/aiff": "aiff", "audio/x-aiff": "aiff", "audio/mp4": "m4a", "audio/x-m4a": "m4a",
+        "video/mp4": "mp4", "audio/amr": "amr", "audio/x-ms-wma": "wma", "audio/pcm": "pcm",
+    }.get(mime.lower().split(";")[0].strip(), "audio")
+    try:
+        transcript = await _sarvam_client().transcribe(audio, filename=f"speech.{extension}", content_type=mime)
+    except ProviderError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    if not sessions.is_active(session_id, session):
+        raise HTTPException(status_code=409, detail="The session changed during transcription.")
+    return {"transcript": transcript, "review_required": True}
+
+
+@app.post("/api/v1/sessions/{session_id}/translate-answer")
+async def translate_answer(session_id: str, payload: AnswerTranslationRequest) -> dict[str, str]:
+    session = sessions.get(session_id)
+    if not payload.consent:
+        raise HTTPException(status_code=403, detail="Confirm before sending this displayed answer text to Sarvam for translation.")
+    _verify_last_answer(session, payload.text)
+    _validate_language(payload.source_language)
+    _validate_language(payload.target_language)
+    try:
+        scan = scan_sensitive_data(payload.text)
+        if any(item.action == "block" for item in scan.findings):
+            raise HTTPException(status_code=409, detail="Text containing a blocked high-risk value cannot be sent for translation.")
+        translated = await _sarvam_client().translate(
+            payload.text,
+            source_language=payload.source_language,
+            target_language=payload.target_language,
+            model=settings.sarvam_translation_model,
+        )
+        result_scan = scan_sensitive_data(translated)
+        validate_answer_grounding(translated, payload.text)
+        if any(item.action == "block" for item in result_scan.findings):
+            raise HTTPException(status_code=502, detail="The translated answer contained a blocked high-risk value and was withheld.")
+    except HTTPException:
+        raise
+    except (ProviderError, PrivacyCheckError, AnswerGroundingError) as exc:
+        raise HTTPException(status_code=502, detail="The translated answer could not be safely returned.") from exc
+    if not sessions.is_active(session_id, session):
+        raise HTTPException(status_code=409, detail="The session changed during translation.")
+    _verify_last_answer(session, payload.text)
+    return {"translated_text": translated, "target_language": payload.target_language}
+
+
+@app.post("/api/v1/sessions/{session_id}/speech/synthesize")
+async def synthesize_speech(session_id: str, payload: SpeechOutputRequest) -> dict[str, str]:
+    session = sessions.get(session_id)
+    if not payload.consent:
+        raise HTTPException(status_code=403, detail="Confirm before sending this text to Sarvam for speech generation.")
+    _verify_last_answer(session, payload.text)
+    _validate_language(payload.language, speech=True)
+    try:
+        scan = scan_sensitive_data(payload.text)
+        if any(item.action == "block" for item in scan.findings):
+            raise HTTPException(status_code=409, detail="Text containing a blocked high-risk value cannot be sent for speech generation.")
+        audio_base64 = await _sarvam_client().synthesize(
+            payload.text,
+            language=payload.language,
+            model=settings.sarvam_tts_model,
+        )
+    except HTTPException:
+        raise
+    except (ProviderError, PrivacyCheckError) as exc:
+        raise HTTPException(status_code=502, detail="Speech generation could not be safely completed. No fallback provider was used.") from exc
+    if not sessions.is_active(session_id, session):
+        raise HTTPException(status_code=409, detail="The session changed during speech generation.")
+    _verify_last_answer(session, payload.text)
+    return {"audio_base64": audio_base64, "content_type": "audio/wav"}
 
 
 @app.post("/api/v1/sessions/{session_id}/workflows/{workflow_id}/cancel")
@@ -996,7 +1216,7 @@ async def cancel_workflow(
     with sessions.lock, session.lock, workflow.lock:
         if sessions.items.get(session_id) is not session or session.status != "active" or session.workflow is not workflow:
             raise HTTPException(status_code=409, detail="The session or review is no longer active.")
-        if workflow.send_state != "review":
+        if workflow.send_state != "review" or workflow.language_busy:
             raise HTTPException(status_code=409, detail="This workflow has already been consumed and cannot be cancelled.")
         workflow.send_state = "cancelled"
         _discard_sensitive_active_content(session)

@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { getWorkflowStatus } from '../lib/workflowActions.js';
+import DraftTranslation from './DraftTranslation.jsx';
 import SafeMarkdown from './SafeMarkdown.js';
 
 function Icon({ name }) {
@@ -11,7 +12,7 @@ function Icon({ name }) {
   return <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{paths[name]}</svg>;
 }
 
-export default function PrivacyReviewPanel({ response, busy = false, error = '', onEdit, onAcknowledge, onApprove, onCancel }) {
+export default function PrivacyReviewPanel({ response, busy = false, error = '', onEdit, onAcknowledge, onApprove, onCancel, sarvamAvailable = false, onTranslate, onUseTranslation }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(response.draft);
   const residual = response.residual_review || {};
@@ -36,7 +37,7 @@ export default function PrivacyReviewPanel({ response, busy = false, error = '',
 
   return <section className="review-card glass-panel" aria-labelledby="review-title">
     <div className="review-top"><span className="review-lock"><Icon name="lock"/></span><div className="review-title"><h2 id="review-title">{response.send_state === 'sent' ? 'Answer received' : response.send_state === 'answer_withheld' ? 'Answer withheld' : response.send_state === 'delivery_unknown' ? 'Answer provider failed' : 'Review before sending'}</h2><p>{status.detail}</p></div><span className={`risk-pill state-${residual.status || 'pending'}`}><i/>{status.label}</span></div>
-    <p className="provider-line">{providerConfigured ? `Answer provider: ${response.provider.name}` : `Answer provider ${response.provider?.name || ''} is not configured`}</p>
+    <p className="provider-line">{providerConfigured ? `Answer provider: ${response.provider.name}` : `Answer provider ${response.provider?.name || ''} is not configured`}{response.provider?.endpoint && <small> · {response.provider.endpoint}</small>}</p>
     {error && <p className="notice" role="alert">{error}</p>}
     {answer && <section className="answer-result" aria-label="Provider answer" aria-live="polite"><div className="answer-label">Answer</div><SafeMarkdown>{answer}</SafeMarkdown><small>{response.provider?.name || 'Provider'}{Array.isArray(response.pages_used) && response.pages_used.length ? ` · pages ${response.pages_used.join(', ')}` : ''}</small></section>}
     <details className="request-disclosure" open={!answer || editing}>
@@ -45,6 +46,7 @@ export default function PrivacyReviewPanel({ response, busy = false, error = '',
       {editing ? <><label className="visually-hidden" htmlFor="sanitized-request">Exact sanitized request</label><textarea id="sanitized-request" className="request-preview request-editor" value={draft} readOnly={busy} onChange={event => setDraft(event.target.value)} /></>
         : <div className="request-preview" role="region" aria-label="Exact sanitized request" tabIndex={0}>{response.draft}</div>}
     </details>
+    {sarvamAvailable && !editing && response.send_state === 'review' && <DraftTranslation response={response} busy={busy} onTranslate={onTranslate} onUseTranslation={onUseTranslation}/>}
     <div className="review-actions">
       {editing ? <><button className="approve-button" type="button" onClick={saveDraft} disabled={busy || !draft.trim()}>{busy ? 'Checking…' : 'Save and recheck'}</button><button className="edit-button" type="button" onClick={() => { setDraft(response.draft); setEditing(false); }} disabled={busy}>Discard edits</button></>
         : <><button className="approve-button" type="button" onClick={onApprove} disabled={!canApprove}><Icon name="send"/>{busy ? 'Working…' : response.send_state === 'sent' ? 'Answer received' : response.send_state === 'answer_withheld' ? 'Answer withheld' : response.send_state === 'delivery_unknown' ? 'Provider delivery failed' : 'Approve & get answer'}</button><button className="edit-button" type="button" onClick={() => { setDraft(response.draft); setEditing(true); }} disabled={busy || !!answer || response.send_state !== 'review'}><Icon name="edit"/>Edit request</button></>}

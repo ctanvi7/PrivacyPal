@@ -22,6 +22,7 @@ import httpx
 
 MAX_REQUEST_BYTES = 4 * 1024 * 1024 + 64 * 1024
 MAX_RESPONSE_BYTES = 512 * 1024
+MAX_SPEECH_RESPONSE_BYTES = 5 * 1024 * 1024
 ACCESS_COOKIE = "__Host-privacypal_access"
 ACCESS_SECONDS = 8 * 60 * 60
 LOGIN_HTML = """<!doctype html>
@@ -187,13 +188,14 @@ def create_app(config: GatewayConfig | None = None, *, transport=None) -> FastAP
             headers["cookie"] = f"privacypal_session={request.cookies['privacypal_session']}"
         headers.update({"host": "127.0.0.1:8000", "origin": "http://127.0.0.1:5173",
             "x-privacypal-proxy-token": config.proxy_token})
+        response_limit = MAX_SPEECH_RESPONSE_BYTES if request.url.path.endswith("/speech/synthesize") else MAX_RESPONSE_BYTES
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(570), follow_redirects=False, transport=transport) as client:
                 async with client.stream(request.method, url, headers=headers, content=bytes(body)) as upstream:
                     content = bytearray()
                     async for chunk in upstream.aiter_bytes():
                         content.extend(chunk)
-                        if len(content) > MAX_RESPONSE_BYTES:
+                        if len(content) > response_limit:
                             raise ValueError("Backend response exceeded the limit")
                     response = Response(bytes(content), status_code=upstream.status_code,
                         headers={"content-type": upstream.headers.get("content-type", "application/json")})

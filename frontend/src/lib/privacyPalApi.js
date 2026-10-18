@@ -48,6 +48,18 @@ export function mapConversationList(value) {
   return Object.freeze({ ...response, items: response.items.map(mapConversationSummary) });
 }
 
+export function mapProviderList(value) {
+  const response = requireObject(value, 'The local service returned invalid answer providers.');
+  if (!Array.isArray(response.items)) throw invalidResponse('The local service returned invalid answer providers.');
+  return Object.freeze({ items: response.items.map(item => {
+    requireObject(item, 'The local service returned an invalid answer provider.');
+    requireText(item.id, 'The local service returned an invalid answer provider.');
+    requireText(item.name, 'The local service returned an invalid answer provider.');
+    if (item.configured !== true) throw invalidResponse('The local service returned an unconfigured answer provider.');
+    return Object.freeze({ ...item });
+  }) });
+}
+
 export function mapConversationDetail(value) {
   const response = requireObject(value, 'The local service returned an invalid conversation.');
   requireText(response.conversation_id, 'The local service returned an invalid conversation.');
@@ -133,6 +145,9 @@ export function createPrivacyPalApi({ client = createApiClient() } = {}) {
       }
       return session;
     },
+    async listProviders({ signal } = {}) {
+      return mapProviderList(await client.request('api/v1/providers', { signal }));
+    },
     async uploadDocument(sessionId, file, { signal } = {}) {
       requireText(sessionId, 'A session is required before uploading a document.');
       if (!file) throw new TypeError('A selected file is required.');
@@ -162,17 +177,65 @@ export function createPrivacyPalApi({ client = createApiClient() } = {}) {
       if (result.status !== 'cleared') throw invalidResponse('The local service did not confirm that the session was cleared.');
       return Object.freeze({ ...result });
     },
-    async submitQuestion(sessionId, documentId, question, { signal } = {}) {
+    async submitQuestion(sessionId, documentId, question, { signal, providerId } = {}) {
       requireText(sessionId, 'An active session is required before asking a question.');
       requireText(documentId, 'A server-confirmed document is required before asking a question.');
       requireText(question, 'Enter a question about your document.');
       const result = await client.request(`api/v1/sessions/${encodeURIComponent(sessionId)}/questions`, {
         method: 'POST',
-        body: { document_id: documentId, question },
+        body: { document_id: documentId, question, ...(providerId ? { provider_id: providerId } : {}) },
         signal,
         timeoutMs: PRIVACY_ANALYSIS_TIMEOUT_MS,
       });
       return mapWorkflowResponse(result);
+    },
+    async translateDraft(sessionId, workflowId, version, sourceLanguage, targetLanguage, { signal } = {}) {
+      requireText(sessionId, 'An active session is required to translate this request.');
+      requireText(workflowId, 'An active workflow is required to translate this request.');
+      if (!Number.isInteger(version) || version < 1) throw invalidResponse('The review version is invalid.');
+      const result = requireObject(await client.request(
+        `api/v1/sessions/${encodeURIComponent(sessionId)}/workflows/${encodeURIComponent(workflowId)}/translate-draft`,
+        { method: 'POST', body: { version, source_language: sourceLanguage, target_language: targetLanguage, consent: true }, signal, timeoutMs: 60_000 },
+      ), 'The local service returned an invalid translation.');
+      requireText(result.translated_text, 'The local service returned an invalid translation.');
+      requireText(result.target_language, 'The local service returned an invalid translation.');
+      if (result.workflow_id !== workflowId || result.version !== version || result.target_language !== targetLanguage) throw invalidResponse('The translation belongs to a different review.');
+      return Object.freeze({ ...result });
+    },
+    async translateAnswer(sessionId, text, sourceLanguage, targetLanguage, { signal } = {}) {
+      requireText(sessionId, 'An active session is required for answer translation.');
+      requireText(text, 'A displayed answer is required.');
+      const result = requireObject(await client.request(
+        `api/v1/sessions/${encodeURIComponent(sessionId)}/translate-answer`,
+        { method: 'POST', body: { text, source_language: sourceLanguage, target_language: targetLanguage, consent: true }, signal, timeoutMs: 60_000 },
+      ), 'The local service returned an invalid translation.');
+      requireText(result.translated_text, 'The local service returned an invalid translation.');
+      return Object.freeze({ ...result });
+    },
+    async transcribeAudio(sessionId, file, { signal } = {}) {
+      requireText(sessionId, 'An active session is required for transcription.');
+      if (!file || !file.size) throw new TypeError('A nonempty audio recording is required.');
+      const form = new FormData();
+      form.append('file', file, file.name);
+      form.append('consent', 'true');
+      const result = requireObject(await client.request(
+        `api/v1/sessions/${encodeURIComponent(sessionId)}/speech/transcribe`,
+        { method: 'POST', body: form, signal, timeoutMs: 90_000 },
+      ), 'The local service returned an invalid transcript.');
+      requireText(result.transcript, 'The local service returned an invalid transcript.');
+      if (result.review_required !== true || result.transcript.length > 2000) throw invalidResponse('The transcript requires review before use.');
+      return Object.freeze({ ...result });
+    },
+    async synthesizeSpeech(sessionId, text, language, { signal } = {}) {
+      requireText(sessionId, 'An active session is required for speech.');
+      requireText(text, 'A displayed answer is required.');
+      const result = requireObject(await client.request(
+        `api/v1/sessions/${encodeURIComponent(sessionId)}/speech/synthesize`,
+        { method: 'POST', body: { consent: true, text, language }, signal, timeoutMs: 60_000 },
+      ), 'The local service returned invalid speech audio.');
+      requireText(result.audio_base64, 'The local service returned invalid speech audio.');
+      if (result.content_type !== 'audio/wav' || !/^[A-Za-z0-9+/]+={0,2}$/.test(result.audio_base64)) throw invalidResponse('The local service returned invalid speech audio.');
+      return Object.freeze({ ...result });
     },
     async editWorkflowDraft(sessionId, workflowId, version, draft, { signal } = {}) {
       requireText(sessionId, 'An active session is required before editing a review.');

@@ -143,3 +143,17 @@ def test_hosted_backend_requires_proxy_token_and_sets_secure_session_cookie(monk
         sid = created.json()["session_id"]
         cleared = client.post(f"/api/v1/sessions/{sid}/clear", headers={"Origin": "http://127.0.0.1:5173", "X-PrivacyPal-Proxy-Token": TOKEN})
         assert cleared.status_code == 200
+
+
+def test_speech_audio_has_bounded_larger_response_without_relaxing_other_routes(config):
+    import app.cloud_gateway as gateway
+    body = b'x' * (gateway.MAX_RESPONSE_BYTES + 1)
+    def handler(_request):
+        return httpx.Response(200, content=body, headers={'Content-Type': 'application/json'})
+    with TestClient(create_app(config, transport=httpx.MockTransport(handler))) as client:
+        headers = {'Authorization': AUTH, 'Origin': ORIGIN}
+        speech = client.post('/api/v1/sessions/synthetic/speech/synthesize', headers=headers)
+        assert speech.status_code == 200 and speech.content == body
+        ordinary = client.get('/api/v1/conversations', headers=headers)
+        assert ordinary.status_code == 502
+    assert gateway.MAX_SPEECH_RESPONSE_BYTES < 6 * 1024 * 1024

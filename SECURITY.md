@@ -25,7 +25,8 @@ PrivacyPal processes user-selected sensitive documents locally, uses Gemma for c
 - There are no accounts, roles, shared workspaces, remote database, cloud file storage, or long-term chat history in the MVP.
 - MVP inputs are pasted text, PDFs, PNG, JPEG, and WebP. Text extraction and OCR are local; never add a hosted OCR fallback. Keep scanned/image OCR failures fail-closed.
 - The user selects each file explicitly. The app does not monitor folders, the clipboard, other apps, or the device.
-- Only a sanitized request approved by the user may be sent to a configured external answer provider.
+- Only the exact sanitized request approved by the user may be sent to the selected configured external answer provider.
+- Optional Sarvam translation and speech requests require separate, visible consent for each action; a failed request never falls back to another provider.
 
 If the app is exposed beyond loopback, gains multiple users, stores data persistently, or adds integrations, pause release and update the threat model and controls first.
 
@@ -43,13 +44,14 @@ Consider malicious or malformed PDFs, indirect prompt injection in document text
 | Full extracted text | Local backend and local Gemma | **No** | Session only |
 | Findings and source locations | Local backend and UI | **No**, except facts deliberately represented in the approved sanitized request | Session only |
 | Sanitized request | Local backend and UI preview | **Only after explicit approval** | Session only; do not log |
+| Translation text or selected audio | Local UI/backend and Sarvam after a separate user action | **Only after explicit consent for that action** | Not stored by PrivacyPal after the response |
 | Placeholder-to-original mapping | Local backend only | **Never** | Memory only; clear with the session |
 | Provider answer | External provider returns it; then local UI | It originates externally; do not resend it unless user explicitly approves a new request | Session only |
 | Provider API key | Backend configuration or later OS credential store | **Never in browser code or requests to the frontend** | Outside source control |
 
 For the MVP, do not add persistent storage or browser local storage/IndexedDB for source files, extracted text, findings, prompts, answers, or placeholder mappings. If a parser needs a temporary file, create it with restrictive local permissions, use a generated name in a private temporary directory, and delete it on success, error, cancellation, and session clear. At startup, remove stale PrivacyPal temporary files safely.
 
-The interface and documentation must say precisely what happens: **the original file and full extracted text stay local; only the exact sanitized request shown and approved by the user is sent to the named external provider.** Never use an unqualified “nothing leaves this device” claim.
+The interface and documentation must say precisely what happens: **the original file and full extracted text stay local; the exact sanitized request is sent to the selected answer provider only after approval; optional translation, audio transcription, or speech generation sends only the specifically reviewed text/audio to Sarvam after a separate consent action.** Never use an unqualified “nothing leaves this device” claim.
 
 ## 3. Local service and browser boundary
 
@@ -114,6 +116,10 @@ Test and assert the invariant: **no external request occurs before approval, and
 - Before enabling a provider, review its data-use, retention, and logging terms and disclose the selected provider to the user before approval.
 - Never log request/response bodies, prompts, findings, file names, keys, tokens, or placeholder values. Operational logs may contain event type, random request/session ID, selected provider identifier, status, elapsed time, and bounded size/count metadata only.
 - Use HTTPS and normal certificate verification. Do not disable TLS verification to work around a provider failure.
+- Keep Sarvam credentials in backend environment settings only. Use a fixed HTTPS endpoint and the `api-subscription-key` header. Do not allow callers to choose provider URLs or models.
+- Sarvam request translation must take its source from the current server-held draft/version, preserve all masked placeholders exactly, return a preview, and require the normal edit/recheck flow before approval. Translation mismatch or service failure must stop without a fallback.
+- Speech-to-text requires separate consent before audio leaves the device; return an editable transcript and never auto-submit it. Text-to-speech and answer translation require separate confirmation naming Sarvam and the text being sent.
+- Keep local OCR unchanged. Do not send documents or images to Sarvam Vision under the current local-only document-processing requirement.
 - If a key is exposed, revoke and rotate it; removing it from the latest commit is not sufficient.
 
 ## 8. File upload and parsing
