@@ -67,12 +67,23 @@ They select bounded complete source sentences and still run masking and the
 independent residual review. Questions containing a specific topic continue to
 select matching passages; unrelated questions do not fall back to the full
 document. A failed review displays incomplete status and cannot enable approval.
+The selector also uses bounded native search terms that actually occur in the
+bound source, so synonymous questions such as "How much do I owe?" can use
+"total due" passages. The same terms are used when building the sanitized draft;
+identifiers are still masked and the exact draft still receives a final audit.
 
 Only one complete Gemma workflow may run at a time in the backend process,
 including edited-draft checks. Additional questions receive a retryable
 `429 MODEL_BUSY` with all checks still pending, rather than waiting inside
 Ollama until their request timeout. Capacity is released on completion, errors,
 and cancellation. Run the session backend as a single worker.
+
+The final audit allows up to 768 generated tokens, including reasoning and the
+native tool response. Incomplete output remains a failure; logs distinguish a
+generation-limit stop from another incomplete response without printing model
+content. Local per-call timeout remains 120 seconds. The AWS CPU configuration
+uses 180 seconds per call and a 600-second Lambda/frontend ceiling, with a
+570-second gateway timeout, to accommodate at most three bounded model calls.
 
 Local inference keeps the configured Gemma model loaded for 900 seconds after each request, reducing reloads between questions. Set `OLLAMA_KEEP_ALIVE_SECONDS` in `backend/.env` to a positive number to change that duration. This controls local model residency, not conversation history or approval. The final audit retains its reasoning budget and source isolation. Backend logs contain stage timing and aggregate token counts, never prompts, source values, responses, or reasoning.
 

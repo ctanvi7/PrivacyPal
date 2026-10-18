@@ -119,6 +119,20 @@ def test_registry_runs_bound_privacy_workflow_and_keeps_mapping_out_of_results()
     assert privacy_workflow_ready(context)
 
 
+def test_native_search_terms_reach_both_selection_and_sanitized_draft():
+    context = ToolContext("session", "workflow", "How much do I owe?", (
+        {"page": 1, "text": "Total due: 2500. The office closes at noon."},
+    ))
+    registry = ToolRegistry()
+    registry.execute(tool_call("detect_sensitive_data", {"terms": ["total due"], "sensitive_spans": []}), context)
+    registry.prepare_draft(context)
+    assert context.selected.text == "Total due: 2500."
+    assert "Total due: 2500" in context.draft.text
+    assert "office closes" not in context.draft.text
+    assert context.selected_pages == (1,)
+    assert not privacy_workflow_ready(context)
+
+
 def test_deterministic_preparation_requires_validated_detection_and_is_not_repeatable():
     context = ToolContext("synthetic-session", "synthetic-workflow", "When is maintenance?", (
         {"page": 1, "text": "Maintenance is on Tuesday. Contact fixture@example.test."},

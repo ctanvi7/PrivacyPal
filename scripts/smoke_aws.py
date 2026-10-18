@@ -41,7 +41,7 @@ def main(review, question="Explain the attached document."):
             require(anonymous.post("/login", headers={"Origin": untrusted_origin},
                 data={"username": "synthetic", "password": "wrong"}), 403, "Untrusted login Origin rejection")
         require(anonymous.get("/api/v1/sessions/synthetic"), 401, "Anonymous API rejection")
-    with httpx.Client(base_url=origin, timeout=450) as client:
+    with httpx.Client(base_url=origin, timeout=620) as client:
         signed_in = require(client.post("/login", headers={"Origin": origin},
             data={"username": access["username"], "password": access["password"]}), 303, "Form sign-in")
         access_cookie = signed_in.headers.get("set-cookie", "").lower()

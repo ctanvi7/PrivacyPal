@@ -188,7 +188,7 @@ def create_app(config: GatewayConfig | None = None, *, transport=None) -> FastAP
         headers.update({"host": "127.0.0.1:8000", "origin": "http://127.0.0.1:5173",
             "x-privacypal-proxy-token": config.proxy_token})
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(390), follow_redirects=False, transport=transport) as client:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(570), follow_redirects=False, transport=transport) as client:
                 async with client.stream(request.method, url, headers=headers, content=bytes(body)) as upstream:
                     content = bytearray()
                     async for chunk in upstream.aiter_bytes():

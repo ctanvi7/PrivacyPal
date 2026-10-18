@@ -1,8 +1,10 @@
 import { ApiError, createApiClient } from './apiClient.js';
+import { CLOUD_HOSTED } from './deployment.js';
 
 // Combined inspection/detection, a separate audit, and at most one repair audit.
-// Allow three 120-second timeouts plus orchestration time.
-export const PRIVACY_ANALYSIS_TIMEOUT_MS = 390_000;
+// CPU-hosted checks allow three 180-second calls plus orchestration time.
+// Local checks retain the three 120-second call budget.
+export const PRIVACY_ANALYSIS_TIMEOUT_MS = CLOUD_HOSTED ? 600_000 : 390_000;
 
 function invalidResponse(message) {
   return new ApiError(message, { code: 'invalid_response', retryable: false });

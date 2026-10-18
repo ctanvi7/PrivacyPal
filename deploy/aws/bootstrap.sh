@@ -31,7 +31,7 @@ secret = json.loads(boto3.client('secretsmanager', region_name=region).get_secre
 values = {
     'DEPLOYMENT_MODE': 'aws', 'APP_HOST': '0.0.0.0', 'APP_PORT': '8000',
     'FRONTEND_ORIGIN': 'http://127.0.0.1:5173', 'OLLAMA_BASE_URL': 'http://127.0.0.1:11434',
-    'GEMMA_MODEL': os.environ['GEMMA_MODEL'], 'MODEL_TIMEOUT_SECONDS': '120',
+    'GEMMA_MODEL': os.environ['GEMMA_MODEL'], 'MODEL_TIMEOUT_SECONDS': '180',
     'OLLAMA_KEEP_ALIVE_SECONDS': '900', 'PDF_MAX_BYTES': '4194304',
     'PRIVACYPAL_PROXY_TOKEN': secret['proxy_token'],
     'ANSWER_PROVIDER_NAME': secret['answer_provider_name'],

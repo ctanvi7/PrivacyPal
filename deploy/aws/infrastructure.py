@@ -80,7 +80,7 @@ def build_template(bootstrap):
             "GatewayLogGroup": {"Type": "AWS::Logs::LogGroup", "Properties": {"LogGroupName": sub("/aws/lambda/${AWS::StackName}-gateway"), "RetentionInDays": 7}},
             "Gateway": {"Type": "AWS::Lambda::Function", "DependsOn": ["PrivateApiIngress", "GatewayLogGroup"], "Properties": {
                 "FunctionName": sub("${AWS::StackName}-gateway"), "Runtime": "python3.12", "Handler": "run.sh",
-                "Architectures": ["x86_64"], "MemorySize": 512, "Timeout": 420,
+                "Architectures": ["x86_64"], "MemorySize": 512, "Timeout": 600,
                 "Role": attr("GatewayRole", "Arn"), "Code": {"S3Bucket": ref("ArtifactBucket"), "S3Key": ref("GatewayArtifactKey")},
                 "Layers": ["arn:aws:lambda:ap-south-1:753240598075:layer:LambdaAdapterLayerX86:30"],
                 "VpcConfig": {"SubnetIds": [ref("LambdaSubnet")], "SecurityGroupIds": [ref("LambdaSecurityGroup")]},

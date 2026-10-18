@@ -585,7 +585,8 @@ async def ask_question(session_id: str, payload: Question) -> dict[str, object]:
             label = {"sensitive": "Sensitive-detail detection", "relevant": "Request preparation",
                 "residual": "Remaining-clue review"}[stage]
             timed_out = isinstance(exc, ModelError) and exc.cause_type in {"ReadTimeout", "ConnectTimeout", "TimeoutError"}
-            message = f"{label} {'timed out' if timed_out else 'could not complete'}. "
+            failure = 'timed out' if timed_out else 'reached its generation limit' if isinstance(exc, ModelError) and exc.cause_type == 'GenerationLimit' else 'could not complete'
+            message = f"{label} {failure}. "
             message += "Retry the local review. Approval is unavailable; no request was sent externally."
             return JSONResponse(status_code=503, content={"error": {
                 "code": "LOCAL_ANALYSIS_FAILED", "message": message, "retryable": True,

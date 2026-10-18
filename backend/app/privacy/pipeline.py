@@ -162,12 +162,12 @@ def scan_sensitive_data(text: str, *, additional_findings: tuple[Finding, ...] =
 
 _WORD = re.compile(r"[a-z0-9]{2,}", re.IGNORECASE)
 _STOP_WORDS = {"about", "after", "also", "and", "are", "can", "does", "for", "from", "how", "into", "its", "more", "need", "not", "that", "the", "their", "there", "these", "they", "this", "was", "what", "when", "where", "which", "who", "will", "with"}
-_BROAD_DOCUMENT_TERMS = {"document", "doc", "file", "attachment", "attached"}
+_BROAD_DOCUMENT_TERMS = {"document", "doc", "file", "attachment", "attached", "pdf", "text", "report", "receipt", "invoice"}
 _BROAD_DOCUMENT_REQUEST_TERMS = {"describe", "explain", "overview", "summarize", "summarise", "summary"}
 _BROAD_REQUEST_FILLER_TERMS = {
     "please", "kindly", "me", "us", "you", "could", "would", "it", "those",
     "in", "of", "to", "is", "an", "simple", "plain", "english", "terms",
-    "words", "brief", "briefly", "detail", "details",
+    "words", "brief", "briefly", "detail", "details", "simply", "language",
 }
 
 
@@ -176,6 +176,8 @@ def _terms(text: str) -> set[str]:
 
 
 def _is_broad_document_request(question: str) -> bool:
+    if re.fullmatch(r"\s*(?:please\s+)?what\s+(?:is|are)\s+(?:this|that|it|these|those)\s+about[\s.!?]*", question, flags=re.IGNORECASE):
+        return True
     terms = _terms(question)
     if not terms & _BROAD_DOCUMENT_REQUEST_TERMS:
         return False
@@ -187,12 +189,14 @@ def _is_broad_document_request(question: str) -> bool:
     return not (terms - _BROAD_DOCUMENT_REQUEST_TERMS - _BROAD_REQUEST_FILLER_TERMS)
 
 
-def select_relevant_content(question: str, source_text: str, *, max_chars: int = MAX_DRAFT_CHARS) -> SelectedContent:
+def select_relevant_content(question: str, source_text: str, *, max_chars: int = MAX_DRAFT_CHARS, search_terms: tuple[str, ...] = ()) -> SelectedContent:
     """Select matching sentences in source order; do not guess if none match."""
     if not isinstance(question, str) or not isinstance(source_text, str) or len(question) > MAX_QUESTION_CHARS or len(source_text) > MAX_ANALYSIS_CHARS:
         raise PrivacyCheckError("Question or source content is invalid or exceeds the configured limit.")
     if not 1 <= max_chars <= MAX_DRAFT_CHARS:
         raise PrivacyCheckError("Selected-content limit is invalid.")
+    if not isinstance(search_terms, tuple) or len(search_terms) > 8 or any(not isinstance(term, str) or not term.strip() or len(term) > 100 for term in search_terms):
+        raise PrivacyCheckError("Document search terms are invalid.")
     # Split after sentence punctuation only when followed by whitespace and a
     # plausible sentence start; this avoids cutting email addresses at dots.
     sentences = []
@@ -207,6 +211,11 @@ def select_relevant_content(question: str, source_text: str, *, max_chars: int =
             spans.append((start, start + len(sentence)))
             offset = start + len(sentence)
     query_terms = _terms(question)
+    # Native tool terms can bridge wording such as "owe" to "total due".
+    # Only exact terms actually present in this bound source contribute.
+    for term in search_terms:
+        if term.casefold() in source_text.casefold():
+            query_terms.update(_terms(term))
     scored = [(len(query_terms & _terms(sentence)), index, sentence) for index, sentence in enumerate(sentences)]
     if _is_broad_document_request(question):
         # Overview requests need document content even if a heading happens to
@@ -258,7 +267,7 @@ def _apply_actions(text: str, findings: tuple[Finding, ...], actions: dict[str, 
     return text, mapping
 
 
-def build_sanitized_draft(question: str, source_text: str, *, actions: dict[str, str] | None = None, max_chars: int = MAX_DRAFT_CHARS, additional_findings: tuple[Finding, ...] = ()) -> SanitizedDraft:
+def build_sanitized_draft(question: str, source_text: str, *, actions: dict[str, str] | None = None, max_chars: int = MAX_DRAFT_CHARS, additional_findings: tuple[Finding, ...] = (), search_terms: tuple[str, ...] = ()) -> SanitizedDraft:
     """Build a minimized draft; block/omit known secrets regardless of model advice."""
     if not isinstance(question, str) or not question.strip() or len(question) > MAX_QUESTION_CHARS:
         raise PrivacyCheckError("A valid question is required to build a draft.")
@@ -279,7 +288,7 @@ def build_sanitized_draft(question: str, source_text: str, *, actions: dict[str,
         # first so it cannot leave half a multiline name/address in the draft.
         source_findings = scan_sensitive_data(source_text, additional_findings=additional_findings).findings
         selection_source, source_mapping = _apply_actions(source_text, source_findings, {}, source_spans=source_spans)
-    selected = select_relevant_content(question, selection_source, max_chars=context_limit)
+    selected = select_relevant_content(question, selection_source, max_chars=context_limit, search_terms=search_terms)
     if selected.status != "selected":
         raise PrivacyCheckError("No document context fits in the sanitized request.")
     draft_spans = [(-1, -1)] * len(prefix)

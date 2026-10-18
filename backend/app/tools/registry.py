@@ -65,6 +65,7 @@ class ToolContext:
     semantic_detection_complete: bool = False
     residual_recheck_required: bool = False
     executed_tools: list[str] = field(default_factory=list)
+    search_terms: tuple[str, ...] = field(default=(), repr=False)
 
     @property
     def source_text(self) -> str:
@@ -123,6 +124,7 @@ class ToolRegistry:
     def _run(self, call: ValidatedToolCall, context: ToolContext) -> dict[str, object]:
         if call.name == "inspect_document":
             terms = [term.casefold() for term in call.arguments["terms"]]
+            context.search_terms = tuple(terms)
             passages = []
             pages_used = set()
             remaining = 8_000
@@ -153,7 +155,7 @@ class ToolRegistry:
             return context.scan.public_view()
 
         if call.name == "select_relevant_content":
-            context.selected = select_relevant_content(context.question, context.source_text)
+            context.selected = select_relevant_content(context.question, context.source_text, search_terms=context.search_terms)
             return {
                 "content": context.selected.text,
                 "status": context.selected.status,
@@ -166,7 +168,7 @@ class ToolRegistry:
             if context.selected.status != "selected":
                 raise ToolValidationError("No relevant document content was found; the workflow needs review.")
             context.draft = build_sanitized_draft(context.question, context.source_text,
-                additional_findings=context.semantic_findings)
+                additional_findings=context.semantic_findings, search_terms=context.search_terms)
             pages = set()
             offset = 0
             for page in context.document_pages:

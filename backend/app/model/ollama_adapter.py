@@ -29,7 +29,7 @@ MAX_TOOL_CALLS = 1
 TOOL_NAME = "inspect_document"
 TOOL_CALL_MAX_PREDICT = 128
 DETECTION_MAX_PREDICT = 1_024
-RESIDUAL_MAX_PREDICT = 512
+RESIDUAL_MAX_PREDICT = 768
 logger = logging.getLogger(__name__)
 
 
@@ -330,7 +330,14 @@ class OllamaAnalyzer:
             if not isinstance(result, dict):
                 raise ModelError("Ollama returned an invalid response.")
             if result.get("done") is False or result.get("done_reason") == "length":
-                raise ModelError("Local Gemma returned an incomplete tool response.", cause_type="IncompleteResponse")
+                cause = "GenerationLimit" if result.get("done_reason") == "length" else "IncompleteResponse"
+                count = result.get("eval_count")
+                stage = tools[0].get("function", {}).get("name") if tools and len(tools) == 1 else "analysis"
+                if stage not in {"inspect_document", "detect_sensitive_data", "review_residual_risk"}:
+                    stage = "analysis"
+                logger.warning("local_model_incomplete stage=%s cause=%s output_tokens=%d max_output_tokens=%d",
+                    stage, cause, count if type(count) is int and count >= 0 else -1, payload["options"]["num_predict"])
+                raise ModelError("Local Gemma returned an incomplete tool response.", cause_type=cause)
             if isinstance(result.get("message"), dict):
                 result["message"].pop("thinking", None)
             # Only aggregate runtime counters are logged, never model content.

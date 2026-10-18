@@ -47,6 +47,12 @@ and multipart/base64 overhead. Other extraction limits remain unchanged.
 CPU inference can be slow, especially on the first request. This is a protected
 single-host demo; production tenancy, availability, abuse controls, and durable
 state need a separate design.
+For CPU inference, each model call has a 180-second timeout and the final audit
+has a 768-token generation budget. The gateway waits up to 570 seconds, while
+Lambda and the hosted frontend allow 600 seconds, covering up to three model
+calls plus orchestration. These limits do not skip checks or permit truncated
+tool output. Logs distinguish `GenerationLimit`, incomplete output, and timeouts
+without retaining prompts, source text, responses, or reasoning.
 The backend admits one complete Gemma workflow at a time. Overlapping questions
 receive `429 MODEL_BUSY` and can be retried after the active review finishes;
 this prevents multiple sessions from filling the CPU model queue and timing out.
@@ -140,6 +146,13 @@ The exact question `explain this please` subsequently passed hosted review in
 question returned `429 MODEL_BUSY` in 0.13 seconds with all checks pending.
 Both synthetic sessions were cleared and no provider send was approved.
 The corresponding source passed 186 backend tests and 68 frontend tests.
+
+Follow-up reliability verification: `explain the pdf` passed hosted review in
+129.59 seconds, selecting page 1 and returning two findings. A fresh CPU model
+load accounted for 51.7 seconds. Runtime inspection confirmed the 180-second
+model timeout, 768-token audit budget, and active Lambda with a 600-second
+timeout. Source validation passed 197 backend tests and 68 frontend tests.
+No provider send was approved and the synthetic session was cleared.
 
 Browser sign-in was subsequently changed to an HTML form because the Function
 URL remaps `WWW-Authenticate` and prevents the native browser prompt. Hosted

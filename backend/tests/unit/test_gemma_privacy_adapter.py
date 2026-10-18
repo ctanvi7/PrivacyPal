@@ -147,6 +147,25 @@ def test_tool_calls_disable_thinking_and_use_a_small_output_budget(monkeypatch):
     assert "thinking" not in result["message"]
 
 
+@pytest.mark.parametrize("response,cause", [
+    ({"done": True, "done_reason": "length", "eval_count": 768, "message": {"thinking": "PRIVATE_REASONING"}}, "GenerationLimit"),
+    ({"done": False, "message": {"content": "PRIVATE_RESPONSE"}}, "IncompleteResponse"),
+])
+def test_incomplete_model_output_stays_blocked_with_content_free_diagnostics(monkeypatch, caplog, response, cause):
+    import httpx
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: real_client(transport=httpx.MockTransport(lambda request: httpx.Response(200, json=response)), **kwargs))
+    analyzer = OllamaAnalyzer("http://127.0.0.1:11434", "gemma4:e4b")
+    with caplog.at_level(logging.WARNING, logger="app.model.ollama_adapter"):
+        with pytest.raises(ModelError) as error:
+            asyncio.run(analyzer._chat([{"role": "user", "content": "PRIVATE_PROMPT"}], [
+                {"function": {"name": "review_residual_risk"}},
+            ]))
+    assert error.value.cause_type == cause
+    assert f"cause={cause}" in caplog.text
+    assert all(value not in caplog.text for value in ("PRIVATE_PROMPT", "PRIVATE_REASONING", "PRIVATE_RESPONSE"))
+
+
 def test_runtime_metrics_log_only_valid_counters_without_model_content(monkeypatch, caplog):
     import httpx
 
@@ -176,7 +195,7 @@ def test_runtime_metrics_log_only_valid_counters_without_model_content(monkeypat
 def test_failed_tool_stage_logs_only_safe_stage_and_exception_type(caplog):
     analyzer = OllamaAnalyzer("http://127.0.0.1:11434", "gemma4:e4b")
     expected = [
-        native_call("detect_sensitive_data"),
+        native_call("detect_sensitive_data", {"terms": ["contract"], "sensitive_spans": []}),
     ]
     calls_seen = []
 

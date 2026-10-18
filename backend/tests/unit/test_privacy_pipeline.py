@@ -66,7 +66,8 @@ def test_broad_document_summary_uses_bounded_complete_sentences():
 
 @pytest.mark.parametrize("question", [
     "explain this please", "Can you explain this?", "Please summarise it briefly",
-    "Describe it in simple terms", "Please summarize",
+    "Describe it in simple terms", "Please summarize", "Explain the pdf",
+    "Explain it simply", "What is this about?",
 ])
 def test_generic_requests_use_bound_document_and_still_mask_identifiers(question):
     source = "The kitchen tap is leaking. Contact demo.person@example.test for repairs."
@@ -84,6 +85,22 @@ def test_explanation_with_a_topic_does_not_expand_to_the_whole_document():
     selected = select_relevant_content("Explain this rent charge please", source)
     assert selected.text == "Rent is due each month."
     assert select_relevant_content("Explain quantum mechanics please", source).status == "no_relevant_content"
+
+
+def test_native_search_terms_bridge_synonyms_without_including_unrelated_sentences():
+    source = "Total due: 2500. Contact billing@example.test for questions. The office closes at noon."
+    selected = select_relevant_content("How much do I owe?", source, search_terms=("total due",))
+    draft = build_sanitized_draft("How much do I owe?", source, search_terms=("total due",))
+    assert selected.text == "Total due: 2500."
+    assert "Total due: 2500" in draft.text
+    assert "office closes" not in draft.text and "billing@example.test" not in draft.text
+    assert select_relevant_content("How much do I owe?", source, search_terms=("invented absent phrase",)).status == "no_relevant_content"
+
+
+@pytest.mark.parametrize("terms", [("",), ("x" * 101,), ("due",) * 9, ["due"]])
+def test_relevance_rejects_invalid_model_search_terms(terms):
+    with pytest.raises(PrivacyCheckError):
+        select_relevant_content("How much do I owe?", "Total due: 2500.", search_terms=terms)
 
 
 def test_overview_includes_facts_even_when_only_heading_matches_question():
