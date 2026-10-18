@@ -23,11 +23,12 @@ PrivacyPal is a local-first AI workspace. In the hackathon MVP, the browser UI, 
 | Text PDF extraction | Local PDF text extraction |
 | Image and scanned-PDF extraction | Local OCR adapter; use the installed Tesseract engine and render PDF pages locally |
 | Sensitive-data checks | Deterministic detectors plus Gemma contextual analysis |
-| Session storage | In-memory, process-local state; no persistent database in the MVP |
+| Active session/workflow storage | In-memory, process-local state; active state is not restored after restart |
+| Conversation history | Local SQLite history containing successful user questions and returned answers for up to 30 days |
 | External answer AI | Server-side provider adapter; provider/model chosen through configuration |
 | Deployment | Local demo on one machine; do not describe a hosted backend as on-device/local |
 
-Do not add a cloud OCR service, cloud file storage, telemetry, account system, or permanent chat history to the MVP.
+Do not add a cloud OCR service, cloud file storage, telemetry, or account system. Conversation persistence stores only successful question/answer pairs in local history; active workflow state remains ephemeral. See DATABASE.md for storage scope and retention.
 
 ## 2. System overview
 
@@ -48,7 +49,7 @@ The original file is never modified. PrivacyPal reduces disclosure risk but does
 9. The user edits, approves, or cancels. Any edit invalidates the previous review and approval and triggers revalidation.
 10. On explicit approval, the backend validates the current draft and sends only that payload to the configured answer provider.
 11. The answer appears in the same chat. Placeholder restoration, if enabled, occurs locally and only for exact known placeholders.
-12. Clearing the session removes temporary content, mappings, files, and approval state.
+12. Clearing the active session removes temporary content, mappings, files, and approval state. Saved history remains unless the user explicitly deletes it.
 
 ## 3. Trust boundaries
 
@@ -204,9 +205,11 @@ It must:
 
 The chosen provider is a runtime configuration decision. The provider name and endpoint must be visible to the user before approval. No provider is called during local analysis.
 
-### 5.9 Session manager and temporary files
+### 5.9 Session manager, temporary files, and planned history
 
-The session manager owns all temporary conversation, document, finding, draft, mapping, approval, and answer state. Access must be scoped by session and workflow. Session clear removes server-side state and temporary files as well as browser state. A process restart may lose active sessions; explain this in the UI.
+The session manager owns active document, finding, draft, mapping, approval, and workflow state. Access must be scoped by session and workflow. Session clear removes active server-side temporary state and files as well as relevant browser state. A process restart may lose active sessions; re-upload is required to continue an active workflow.
+
+Implemented: local SQLite conversation history in the operating system's per-user application-data directory, outside the repository and temporary upload directory. Persist only user questions and returned AI answers after a successful provider response, with a maximum 30-day retention per message. Detected high-risk credentials are not retained in history. Do not persist original documents, extracted text, findings, drafts, placeholder mappings, approval payloads, credentials, or full provider request bodies. No application-managed backups are created. SQLite is not encrypted by default. If the answer succeeds but history cannot be written, the answer response reports `history_saved: false`. Deleting local history cannot remove content already transmitted to an external answer provider. Session clear does not delete saved history unless the user explicitly chooses history deletion. See DATABASE.md for schema and cleanup behavior.
 
 ## 6. Workflow state machine
 
@@ -282,11 +285,13 @@ Required tests:
 - Logs/errors contain no raw document data, secrets, mappings, prompts, or full payloads.
 - The complete upload → ask → analyze → sanitize → review → approve → answer flow works with synthetic data.
 
-## 10. MVP non-goals
+## 10. MVP scope and planned history
+
+Implemented: local 30-day conversation history and backend create/list/retrieve/delete APIs. Frontend history navigation remains a separate task.
 
 Do not implement in this version:
-- Accounts, cloud sync, permanent chat history, or multi-user hosting.
-- Persistent storage of documents, text, findings, drafts, answers, or mappings.
+- Accounts, cloud sync, or multi-user hosting.
+- Persistent storage of documents, extracted text, findings, drafts, mappings, approval payloads, credentials, or provider request bodies.
 - Cloud OCR, cloud file processing, or automatic cloud fallback.
 - Arbitrary web browsing, code execution, shell access, or model-selected network tools.
 - Automatic sending without user review and approval.

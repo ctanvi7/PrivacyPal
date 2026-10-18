@@ -17,7 +17,7 @@ function initialState() {
 
 function safeUploadError(error) {
   if (error instanceof ApiError) {
-    return { code: error.code, message: error.message, retryable: error.retryable };
+    return { code: error.code, status: error.status, message: error.message, retryable: error.retryable };
   }
   return { code: 'upload_error', message: GENERIC_UPLOAD_ERROR, retryable: true };
 }
@@ -28,6 +28,7 @@ function safeUploadError(error) {
 export function createDocumentUploadController({
   createSession,
   uploadDocument,
+  getConversationId = () => null,
   validate = getDocumentValidationError,
   timeoutMs = 30_000,
 } = {}) {
@@ -132,7 +133,7 @@ export function createDocumentUploadController({
         if (currentSequence !== sequence || controller.signal.aborted) return null;
         return (async () => {
           if (!session) {
-            session = await createSession({ signal: controller.signal });
+            session = await createSession({ signal: controller.signal, conversationId: getConversationId() });
             if (currentSequence !== sequence || controller.signal.aborted) return null;
             if (!session || typeof session.session_id !== 'string' || !session.session_id) {
               throw new ApiError('The local service returned an invalid session response.', { code: 'invalid_response' });

@@ -108,3 +108,12 @@ def test_invalid_provider_url_fails_without_exposing_value(env_file, monkeypatch
         config.get_settings()
     assert url not in str(error.value)
     assert "secret" not in str(error.value)
+
+
+def test_database_path_uses_same_file_and_process_precedence_as_provider(env_file, tmp_path, monkeypatch):
+    file_path = tmp_path / "file-history.sqlite3"
+    process_path = tmp_path / "process-history.sqlite3"
+    env_file.write_text(f"PRIVACYPAL_DATABASE_PATH={file_path}\n")
+    assert config.get_settings().database_path == str(file_path)
+    monkeypatch.setenv("PRIVACYPAL_DATABASE_PATH", str(process_path))
+    assert config.get_settings().database_path == str(process_path)

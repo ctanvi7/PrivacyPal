@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 from starlette.datastructures import UploadFile
 
 from app.config import get_settings
+from app.conversation_store import ConversationStore
 from app.answer_provider import (
     AnswerProvider,
     AnswerProviderError,
@@ -43,7 +44,6 @@ from app.privacy.pipeline import (
 from app.provider.answer_provider import (
     ApprovedRequest,
     OpenAICompatibleProvider,
-    ProviderError,
 )
 from app.tools.registry import (
     ToolContext,
@@ -115,6 +115,7 @@ class Session:
     touched_at: float = 0.0
     requests: dict[str, "ReviewRequest"] | None = None
     status: Literal["active", "clearing", "expired"] = "active"
+    conversation_id: str | None = None
     analysis_id: str | None = None
     lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
@@ -142,6 +143,10 @@ class PastedText(BaseModel):
 class Question(BaseModel):
     document_id: str = Field(min_length=1, max_length=80)
     question: str = Field(min_length=1, max_length=MAX_QUESTION_CHARS)
+
+
+class SessionCreate(BaseModel):
+    conversation_id: str | None = Field(default=None, min_length=1, max_length=80)
 
 
 class DraftUpdate(BaseModel):
@@ -177,20 +182,26 @@ class SessionStore:
             session = self.items.pop(key)
             with session.lock:
                 session.status = "expired"
-                session.document = None
-                session.document_id = None
+                _discard_sensitive_active_content(session)
                 session.workflow = None
-                session.requests = {}
                 session.analysis_id = None
 
-    def create(self) -> str:
+    def create(self, conversation_id: str | None = None) -> str:
         with self.lock:
             self._expire_idle()
             if len(self.items) >= self.max_sessions:
                 raise HTTPException(status_code=429, detail="Too many active local sessions. Clear one and try again.")
             session_id = str(uuid4())
-            self.items[session_id] = Session(touched_at=time.monotonic())
+            self.items[session_id] = Session(touched_at=time.monotonic(), conversation_id=conversation_id)
             return session_id
+
+    def remove_conversation(self, conversation_id: str) -> int:
+        with self.lock:
+            matched = [key for key, session in self.items.items()
+                       if session.conversation_id == conversation_id]
+            for key in matched:
+                self.clear(key)
+            return len(matched)
 
     def get(self, session_id: str) -> Session:
         with self.lock:
@@ -218,16 +229,23 @@ class SessionStore:
                 raise HTTPException(status_code=404, detail="Session expired. Start a new session.")
             with session.lock:
                 session.status = "clearing"
-                session.document = None
-                session.document_id = None
+                _discard_sensitive_active_content(session)
                 session.workflow = None
-                session.requests = {}
                 session.analysis_id = None
                 self.items.pop(session_id, None)
 
 
 sessions = SessionStore()
 app.state.answer_provider = None
+app.state.conversation_store = None
+
+
+def _conversation_store() -> ConversationStore:
+    store = app.state.conversation_store
+    if store is None:
+        store = ConversationStore(settings.database_path)
+        app.state.conversation_store = store
+    return store
 
 
 @app.middleware("http")
@@ -281,6 +299,12 @@ async def http_error_handler(_request: Request, exc: HTTPException) -> JSONRespo
         502: "PROVIDER_FAILED",
         503: "LOCAL_ANALYSIS_FAILED",
     }.get(exc.status_code, "REQUEST_FAILED")
+    if exc.status_code == 404:
+        code = (
+            "UNKNOWN_SESSION"
+            if "session expired" in str(exc.detail).casefold()
+            else "NOT_FOUND"
+        )
     return JSONResponse(
         status_code=exc.status_code,
         content={
@@ -409,12 +433,32 @@ def _get_workflow(
             status_code=404,
             detail="This review is no longer active. Start a new question.",
         )
-    if workflow.document_id != session.document_id:
+    if workflow.send_state == "review" and workflow.document_id != session.document_id:
         raise HTTPException(
             status_code=409,
             detail="The document changed. Start a new review.",
         )
     return session, workflow
+
+
+def _discard_sensitive_active_content(session: Session) -> None:
+    """Release document/workflow content while retaining only retry-safe status IDs."""
+    session.document = None
+    session.document_id = None
+    if session.requests is not None:
+        session.requests.clear()
+    workflow = session.workflow
+    if workflow is not None:
+        workflow.question = ""
+        workflow.draft = ""
+        workflow.findings = ()
+        workflow.placeholder_map.clear()
+        workflow.residual = None
+        workflow.contextual_flags = ()
+        workflow.semantic_values = None
+        workflow.local_checks.clear()
+        workflow.answer = None
+        workflow.pages_used = ()
 
 
 @app.get("/health", tags=["health"])
@@ -423,11 +467,99 @@ def health() -> dict[str, str]:
 
 
 @app.post("/api/v1/sessions", status_code=201)
-async def create_session() -> JSONResponse:
-    session_id = sessions.create()
-    response = JSONResponse({"session_id": session_id, "expires_in_seconds": 1_800}, status_code=201)
-    response.set_cookie(SESSION_COOKIE, session_id, httponly=True, secure=settings.deployment_mode == "aws", samesite="strict", path="/api/v1/sessions", max_age=1_800)
+async def create_session(payload: SessionCreate | None = None) -> JSONResponse:
+    store = _conversation_store()
+    conversation_id = payload.conversation_id if payload else None
+    try:
+        if conversation_id is not None and not store.exists(conversation_id):
+            raise HTTPException(status_code=404, detail="Conversation not found or expired.")
+        if conversation_id is None:
+            conversation_id = store.create()["conversation_id"]
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503, detail="Conversation history is unavailable."
+        ) from exc
+    try:
+        session_id = sessions.create(conversation_id)
+    except HTTPException:
+        if payload is None or payload.conversation_id is None:
+            try:
+                store.delete(conversation_id)
+            except Exception:
+                pass
+        raise
+    response = JSONResponse({
+        "session_id": session_id,
+        "expires_in_seconds": 1_800,
+        "conversation_id": conversation_id,
+    }, status_code=201)
+    response.set_cookie(SESSION_COOKIE, session_id, httponly=True,
+                        secure=settings.deployment_mode == "aws", samesite="strict",
+                        path="/api/v1/sessions", max_age=1_800)
     return response
+
+
+@app.post("/api/v1/conversations", status_code=201)
+async def create_conversation() -> dict[str, str]:
+    try:
+        return _conversation_store().create()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503, detail="Conversation history is unavailable."
+        ) from exc
+
+
+@app.get("/api/v1/conversations")
+async def list_conversations(
+    limit: int = 50, offset: int = 0
+) -> dict[str, object]:
+    if not 1 <= limit <= 100 or offset < 0:
+        raise HTTPException(status_code=422, detail="Invalid history page size or offset.")
+    try:
+        items = _conversation_store().list(limit=limit, offset=offset)
+        return {"items": items, "limit": limit, "offset": offset}
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503, detail="Conversation history is unavailable."
+        ) from exc
+
+
+@app.get("/api/v1/conversations/{conversation_id}")
+async def get_conversation(conversation_id: str) -> dict[str, object]:
+    try:
+        result = _conversation_store().get(conversation_id)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503, detail="Conversation history is unavailable."
+        ) from exc
+    if result is None:
+        raise HTTPException(status_code=404, detail="Conversation not found or expired.")
+    return result
+
+
+@app.delete("/api/v1/conversations/{conversation_id}")
+async def delete_conversation(conversation_id: str) -> JSONResponse:
+    # Active state is memory-only today; remove it first so no later operation can
+    # use its document/workflow while the persisted conversation is being deleted.
+    sessions.remove_conversation(conversation_id)
+    try:
+        deleted = _conversation_store().delete(conversation_id)
+    except Exception:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": {
+                    "code": "CONVERSATION_CLEANUP_INCOMPLETE",
+                    "message": "Active temporary data was cleared, but saved history could not be deleted.",
+                    "retryable": True,
+                }
+            },
+        )
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Conversation not found or expired.")
+    return JSONResponse(status_code=200, content={"status": "deleted"})
 
 
 @app.post("/api/v1/sessions/{session_id}/documents", status_code=201)
@@ -587,7 +719,7 @@ async def ask_question(session_id: str, payload: Question) -> dict[str, object]:
             timed_out = isinstance(exc, ModelError) and exc.cause_type in {"ReadTimeout", "ConnectTimeout", "TimeoutError"}
             failure = 'timed out' if timed_out else 'reached its generation limit' if isinstance(exc, ModelError) and exc.cause_type == 'GenerationLimit' else 'could not complete'
             message = f"{label} {failure}. "
-            message += "Retry the local review. Approval is unavailable; no request was sent externally."
+            message += "Retry the local review. Approval is unavailable. No request was sent externally."
             return JSONResponse(status_code=503, content={"error": {
                 "code": "LOCAL_ANALYSIS_FAILED", "message": message, "retryable": True,
                 "local_checks": checks,
@@ -793,8 +925,9 @@ async def approve_and_send(
     )
     try:
         answer = await provider.send(approved)
-    except ProviderError as exc:
+    except Exception as exc:
         workflow.send_state = "delivery_unknown"
+        _discard_sensitive_active_content(session)
         raise HTTPException(
             status_code=502,
             detail=(
@@ -802,33 +935,56 @@ async def approve_and_send(
                 "approval cannot be retried."
             ),
         ) from exc
-    try:
-        validate_answer_grounding(answer, approved.content)
-    except AnswerGroundingError:
-        workflow.answer = None
-        workflow.send_state = "answer_withheld"
-        return JSONResponse(status_code=502, content={"error": {
-            "code": "ANSWER_WITHHELD",
-            "message": "The provider answer was withheld because its personal details could not be verified against the approved request. No automatic retry was made.",
-            "retryable": False,
-        }})
-    if payload.restore_placeholders:
-        for placeholder, original in sorted(
-            workflow.placeholder_map.items(),
-            key=lambda pair: len(pair[0]),
-            reverse=True,
-        ):
-            answer = answer.replace(placeholder, original)
-    workflow.answer = answer
-    workflow.send_state = "sent"
-    return {
-        "workflow_id": workflow.workflow_id,
-        "version": workflow.version,
-        "answer": answer,
-        "provider": _provider_view(),
-        "pages_used": list(workflow.pages_used),
-        "send_state": workflow.send_state,
-    }
+    # Serialize completion with clear/delete so an in-flight answer cannot
+    # recreate history after cleanup has invalidated the active session.
+    with sessions.lock, session.lock, workflow.lock:
+        try:
+            answer_findings = scan_sensitive_data(answer)
+            if any(finding.action == "block" for finding in answer_findings.findings):
+                raise AnswerGroundingError("The answer contains a high-risk value.")
+            validate_answer_grounding(answer, approved.content)
+        except (AnswerGroundingError, PrivacyCheckError):
+            workflow.answer = None
+            workflow.send_state = "answer_withheld"
+            _discard_sensitive_active_content(session)
+            return JSONResponse(status_code=502, content={"error": {
+                "code": "ANSWER_WITHHELD",
+                "message": "The provider answer was withheld because its personal details could not be verified against the approved request. No automatic retry was made.",
+                "retryable": False,
+            }})
+        if payload.restore_placeholders:
+            for placeholder, original in sorted(
+                workflow.placeholder_map.items(),
+                key=lambda pair: len(pair[0]),
+                reverse=True,
+            ):
+                answer = answer.replace(placeholder, original)
+        workflow.answer = answer
+        workflow.send_state = "sent"
+        history_saved = False
+        if session.conversation_id and sessions.is_active(session_id, session):
+            try:
+                history_saved = _conversation_store().save_answer_pair(
+                    session.conversation_id,
+                    workflow.workflow_id,
+                    workflow.question,
+                    answer,
+                )
+            except Exception:
+                # The provider answer is already confirmed. Preserve the successful
+                # response, but tell the client the local history write did not finish.
+                history_saved = False
+        response = {
+            "workflow_id": workflow.workflow_id,
+            "version": workflow.version,
+            "answer": answer,
+            "provider": _provider_view(),
+            "pages_used": list(workflow.pages_used),
+            "send_state": workflow.send_state,
+            "history_saved": history_saved,
+        }
+        _discard_sensitive_active_content(session)
+        return response
 
 
 @app.post("/api/v1/sessions/{session_id}/workflows/{workflow_id}/cancel")
@@ -843,6 +999,7 @@ async def cancel_workflow(
         if workflow.send_state != "review":
             raise HTTPException(status_code=409, detail="This workflow has already been consumed and cannot be cancelled.")
         workflow.send_state = "cancelled"
+        _discard_sensitive_active_content(session)
         session.workflow = None
     return {"status": "cancelled"}
 
@@ -861,14 +1018,13 @@ async def remove_document(session_id: str, document_id: str) -> dict[str, str]:
                 if workflow.send_state == "sending":
                     raise HTTPException(status_code=409, detail="An approved provider request is already in progress; wait for its result before removing the document.")
                 workflow.send_state = "cancelled"
-                session.workflow = None
-        session.document = None
-        session.document_id = None
+        _discard_sensitive_active_content(session)
+        session.workflow = None
     return {"status": "removed"}
 
 
 @app.post("/api/v1/sessions/{session_id}/clear")
-async def clear_session(session_id: str) -> dict[str, str]:
+async def clear_session(session_id: str) -> JSONResponse:
     session = sessions.get(session_id)
     sessions.clear(session_id, session)
     response = JSONResponse({"status": "cleared"})

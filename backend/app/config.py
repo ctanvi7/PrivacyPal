@@ -36,6 +36,18 @@ class Settings:
     answer_provider_model: str = ""
     answer_provider_api_key: str = field(default="", repr=False)
     answer_provider_timeout_seconds: float = 30.0
+    database_path: str = ""
+
+
+def _default_database_path() -> Path:
+    """Return an OS per-user data path without placing state in the repository."""
+    if os.name == "nt":
+        base = Path(os.getenv("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+    elif os.getenv("XDG_DATA_HOME"):
+        base = Path(os.environ["XDG_DATA_HOME"])
+    else:
+        base = Path.home() / ".local" / "share"
+    return base / "PrivacyPal" / "conversations.sqlite3"
 
 
 def _positive_int(env: Mapping[str, str], name: str, default: int) -> int:
@@ -119,6 +131,11 @@ def get_settings() -> Settings:
         ):
             raise ValueError("ANSWER_PROVIDER_URL must be an HTTPS base URL or chat/completions endpoint without credentials, query, or fragment")
 
+    configured_database_path = env.get("PRIVACYPAL_DATABASE_PATH", "").strip()
+    database_path = Path(configured_database_path or _default_database_path()).expanduser()
+    if not database_path.is_absolute():
+        raise ValueError("PRIVACYPAL_DATABASE_PATH must be an absolute path")
+
     return Settings(
         host=str(address),
         deployment_mode=deployment_mode,
@@ -138,4 +155,5 @@ def get_settings() -> Settings:
         answer_provider_model=provider_model,
         answer_provider_api_key=provider_api_key,
         answer_provider_timeout_seconds=_positive_float(env, "ANSWER_PROVIDER_TIMEOUT_SECONDS", 30.0),
+        database_path=str(database_path),
     )

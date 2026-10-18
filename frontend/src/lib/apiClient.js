@@ -7,7 +7,8 @@ export const WORKFLOW_API_CONTRACT = Object.freeze({
   implemented: true,
   connected: Object.freeze([
     'session creation', 'document upload', 'local question analysis', 'draft editing',
-    'warning acknowledgement', 'review cancellation', 'approval and answer delivery',
+    'review acknowledgement', 'review cancellation', 'explicit approval and answer delivery',
+    'conversation creation, listing, retrieval, and deletion',
   ]),
   pending: Object.freeze([]),
 });

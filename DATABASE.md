@@ -9,13 +9,13 @@
 
 This document defines how the MVP stores and clears application data. It accompanies ARCHITECTURE.md, SECURITY.md, the product requirements, and design.md.
 
-**MVP decision: PrivacyPal has no persistent application database.** Use process-local in-memory session state. This is intentional: the hackathon product handles sensitive files and does not need durable history to deliver its core workflow.
+**Current implementation:** a persistent SQLite database stores approved conversation history. Active session and workflow state remains process-local and is lost on backend restart.
 
-Do not add SQLite, PostgreSQL, cloud storage, analytics, or chat-history persistence unless a concrete product requirement is approved and this document is updated first.
+**Implemented:** use local SQLite for conversation history only. Persist user questions and returned AI answers for no more than 30 days. Do not add cloud storage, analytics, or application-managed backups. The SQLite file belongs in the operating system per-user application-data directory, outside the repository and temporary upload directory. SQLite is not encrypted by default; no encryption is implemented.
 
 ## 2. Data-flow and retention rule
 
-The browser, FastAPI backend, Ollama/Gemma, document extraction, and OCR run on the same user's computer in the MVP. Original files, extracted text, findings, drafts, and placeholder mappings stay in temporary local state. Only the exact sanitized request explicitly approved by the user may be sent to the configured external answer provider.
+The browser, FastAPI backend, Ollama/Gemma, document extraction, and OCR run on the same user's computer in the MVP. Original files, extracted text, findings, drafts, placeholder mappings, and active approval state stay in memory or restrictive temporary storage; none belong in SQLite. Only the exact sanitized request explicitly approved by the user may be sent to the configured external answer provider. Conversation history is implemented in local SQLite, subject to the successful-answer and retention rules below.
 
 Provider-side retention is outside PrivacyPal's control. The UI must say which provider receives the approved request and must not promise that clearing a local session deletes content already sent externally.
 
@@ -24,16 +24,16 @@ Provider-side retention is outside PrivacyPal's control. The UI must say which p
 | Original upload bytes | Request memory or restrictive temporary file | Only while extracting/processing; delete on all exits |
 | Pasted source text | In-memory session | Until workflow completion, clear, expiry, or process exit |
 | Extracted/OCR text and page references | In-memory session | Until workflow completion, clear, expiry, or process exit |
-| User question and chat turns | In-memory session | Until clear, expiry, or process exit |
+| User question | Local SQLite conversation history, stored only with a successfully returned answer | Up to 30 days; failed requests do not retain sensitive question content |
 | Sensitive findings and raw matched values | In-memory workflow state | Until workflow completion, clear, expiry, or process exit |
 | Placeholder-to-original mapping | In-memory workflow state only | Until clear, expiry, or process exit |
 | Sanitized draft and privacy result | In-memory workflow state | Until completed, cancelled, clear, expiry, or process exit |
 | Approval state and draft fingerprint | In-memory workflow state | One workflow version; discard after use, cancel, clear, expiry, or process exit |
-| External provider answer | In-memory session | Until clear, expiry, or process exit |
+| Returned AI answer | Local SQLite conversation history only after a confirmed returned answer | Up to 30 days; never persist a failed/unreturned answer |
 | Provider API key and credentials | Backend environment/configuration only | Never persisted in application data |
 | Operational logs | Local logs, if enabled | Minimum necessary; no content or secrets |
 
-Use a finite idle timeout. MVP default: expire a session after 30 minutes without activity. Enforce expiry on the backend before every sensitive operation, not only in the browser. Process restart discards active in-memory sessions.
+Use a finite idle timeout for active sessions. Current default: expire a session after 30 minutes without activity. Enforce expiry on the backend before every sensitive operation, not only in the browser. Process restart discards active in-memory sessions and workflows; it does not erase separately persisted conversation history. History retention is an absolute maximum of 30 days per message, independent of session idle expiry.
 
 Temporary file handling:
 - Use a dedicated temporary directory with restrictive permissions.
@@ -68,7 +68,7 @@ Fields:
 - page/region references and extraction_status: temporary metadata.
 - created_at: timestamp.
 
-Do not persist original bytes or extracted text.
+Do not persist original bytes, extracted text, or document metadata in SQLite.
 
 ### WorkflowRun
 
@@ -129,7 +129,7 @@ Fields:
 - provider identifier, safe status, timestamps, safe error code.
 - answer text and validated source references in memory only.
 
-Do not persist request or response bodies. Provider-side retention is outside the local session store.
+Do not persist provider request bodies or raw provider response bodies as operational records. A successfully returned answer may be saved as conversation history under the planned history policy. Provider-side retention is outside PrivacyPal's control.
 
 ## 4. Approval and concurrency
 
@@ -160,28 +160,42 @@ Do not include document-derived content in crash reports or analytics. Any futur
 
 ## 6. Clear and expiration behavior
 
-Clear Session must remove:
+Clear Session removes active temporary state, not persisted history by default. It must remove:
 - Original and extracted document content.
-- Chat turns, findings, model/tool intermediates, and sanitized drafts.
-- Placeholder mappings, approvals, and provider answers.
+- Active chat/workflow intermediates, findings, and sanitized drafts.
+- Placeholder mappings, approvals, and active provider results.
 - Temporary files and relevant browser state.
+
+Saved conversation history remains unless the user explicitly chooses to delete it. Conversation deletion must remove that conversation's persisted question/answer records and also clear any associated active workflow, document context, extracted text, mappings, approvals, and app-owned temporary files. Delete cleanup must be best-effort, report incomplete cleanup accurately, and never claim that local deletion removes content already transmitted to an external provider.
+
+Failed requests must not retain sensitive request or answer content. Interrupted or delivery-uncertain requests do not currently retain even a minimal status record. Temporary documents, extracted text, and active workflow data are cleaned on completion, cancellation, session clear, expiry, failure, document removal, and conversation deletion.
 
 Backend expiry is checked before every sensitive operation. Expired sessions cannot be revived or approved; require a new session and upload. Clear success should be reported only after cleanup completes. If cleanup partially fails, report that accurately and continue best-effort cleanup.
 
 Clearing cannot delete information already transmitted to an external provider. State this clearly in the UI.
 
-## 7. Persistent storage: out of scope
+## 7. Persistent conversation history
 
-The MVP does not need database migrations, tables, backups, or database credentials. Do not implement the optional SQLite schema from earlier drafts; it adds work without serving the core demo.
+The implementation uses a small local SQLite store located under the operating system's per-user application-data directory, outside the repository and temporary upload directory. `PRIVACYPAL_DATABASE_PATH` may override this with an absolute path; a custom path must be protected with equivalent per-user filesystem permissions. No application-managed backups are created. On POSIX systems, the application sets the database directory to mode `0700` and the database file to `0600`; on Windows, the default path relies on the per-user application-data directory's inherited OS permissions. SQLite is not encrypted by default, and encryption at rest is not implemented.
 
-If a future requirement needs persistence, first document:
-1. The specific fields and use case that need to survive a process restart.
-2. Why in-memory state is insufficient.
-3. Whether any field is personal, document-derived, sensitive, or reversible.
-4. Retention, deletion, access control, encryption/key management, backups, and user disclosure.
-5. How approval remains tied to the exact current sanitized request.
+Schema:
 
-A future persistent store must keep document bytes, extracted text, conversations, findings, placeholder mappings, sanitized request bodies, provider answers, and credentials out of persistent tables unless a separately reviewed product decision explicitly changes that rule.
+### Conversation
+- `conversation_id`: random opaque identifier (primary key).
+- `created_at`, `updated_at`: UTC timestamps used for ordering and retention.
+
+### Message
+- `message_id`: random opaque identifier (primary key).
+- `conversation_id`: foreign key with cascade deletion.
+- `role`: `user` or `assistant`.
+- `content`: question text for user messages or confirmed returned answer for assistant messages.
+- `created_at`: UTC timestamp.
+- `status`: `complete` for the successful question/answer pairs currently persisted; failed and delivery-uncertain turns are not stored.
+- `workflow_id`: internal idempotency key, unique with conversation and role; not returned by history APIs.
+
+Only successful question/answer pairs are retained, and only after an answer has been returned, with an absolute 30-day maximum per message. Retention is measured from each message's creation time; later activity in a conversation does not extend older messages' lifetime. Messages containing a detected high-risk credential are not persisted. A failed request must not persist its sensitive question or answer content. For an interrupted or delivery-uncertain call, no content is retained; the current implementation does not persist even a minimal status record. Do not persist original documents, extracted text, privacy findings, drafts, placeholder mappings, approval payloads/fingerprints, credentials, prompts, full provider requests, or unreturned/failed answers.
+
+Delete expired history at startup and during history operations. Expired messages are removed individually; empty conversations are removed after 30 days of inactivity. Conversation creation, listing, retrieval, and deletion APIs are implemented; see docs/API_CONTRACT.md. Session clear deletes temporary active state but leaves saved history unless the user explicitly selects history deletion. Local deletion cannot recall content already transmitted to an external provider. File deletion is application-level deletion and is not a promise of forensic erasure from storage media, filesystem journals, or OS caches. A provider answer is still returned if the subsequent history write fails or is refused by the high-risk-content guard; the API reports `history_saved: false`.
 
 ## 8. Tests and acceptance criteria
 
@@ -191,7 +205,7 @@ Required tests:
 - Session IDs are random and do not encode identity.
 - Expired, cleared, and cross-session operations are rejected.
 - Clear Session removes all in-memory state and app-owned temporary files on success and failure paths.
-- Raw source text, findings, mappings, prompts, drafts, answers, and credentials never enter logs or persistent storage.
+- Raw source text, findings, mappings, prompts, drafts, and credentials never enter logs or persistent storage. History stores only successful user questions and returned answers for up to 30 days.
 - High-risk secrets never reach the provider mock.
 - Provider is called only after approval for the current draft and provider.
 - Editing after review invalidates the prior check and approval.
@@ -204,7 +218,8 @@ Required tests:
 
 ## 9. Agent checklist
 
-- [ ] Use process-local in-memory session state; no persistent database in the MVP.
+- [ ] Keep active session/workflow state in memory or restrictive temporary storage; never persist document or review payloads.
+- [x] Persist only successful questions and returned answers in per-user local SQLite for up to 30 days; no application-managed backups.
 - [ ] Keep document bytes and OCR temp files short-lived and clean them up on every path.
 - [ ] Never log content, raw findings, mappings, prompts, payloads, answers, credentials, or cookies.
 - [ ] Enforce session ownership, idle expiry, and clear behavior on the backend.

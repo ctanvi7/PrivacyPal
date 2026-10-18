@@ -28,6 +28,19 @@ test('keeps selection separate until the injected uploader confirms success', as
   assert.equal(controller.getState().uploadedSessionId, 'session-1');
 });
 
+test('creates an upload session for the active saved conversation', async () => {
+  let suppliedConversationId;
+  const controller = createDocumentUploadController({
+    getConversationId: () => 'conversation-selected',
+    createSession: async options => { suppliedConversationId = options.conversationId; return { session_id: 'session-1', conversation_id: options.conversationId, expires_in_seconds: 1800 }; },
+    uploadDocument: async () => ({ document_id: 'document-1' }),
+  });
+  controller.select(validFile);
+  await controller.upload();
+  assert.equal(suppliedConversationId, 'conversation-selected');
+  assert.equal(controller.getState().session.conversation_id, 'conversation-selected');
+});
+
 test('prevents duplicate uploads and returns the same in-flight operation', async () => {
   let finishUpload;
   let calls = 0;

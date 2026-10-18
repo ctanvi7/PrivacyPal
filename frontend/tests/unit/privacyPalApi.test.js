@@ -16,6 +16,40 @@ test('creates a session with the confirmed route and validates its response', as
   await assert.rejects(malformed.createSession(), error => error instanceof ApiError && error.code === 'invalid_response');
 });
 
+test('attaches session creation to the selected conversation without changing the route', async () => {
+  let call;
+  const api = createPrivacyPalApi({ client: { request: async (...args) => { call = args; return { session_id: 's-1', conversation_id: 'c-1', expires_in_seconds: 1800 }; } } });
+  const session = await api.createSession({ conversationId: 'c-1' });
+  assert.equal(call[0], 'api/v1/sessions');
+  assert.deepEqual(call[1].body, { conversation_id: 'c-1' });
+  assert.equal(session.conversation_id, 'c-1');
+  const mismatched = createPrivacyPalApi({ client: { request: async () => ({ session_id: 's-2', conversation_id: 'other', expires_in_seconds: 1800 }) } });
+  await assert.rejects(mismatched.createSession({ conversationId: 'c-1' }), error => error.code === 'invalid_response');
+});
+
+test('connects conversation create, paginated list, detail, and confirmed delete routes', async () => {
+  const calls = [];
+  const api = createPrivacyPalApi({ client: { request: async (...args) => {
+    calls.push(args);
+    if (args[0] === 'api/v1/conversations' || args[0].includes('?')) return args[1].method === 'POST'
+      ? { conversation_id: 'c-1', created_at: 'today', updated_at: 'today' }
+      : { items: [{ conversation_id: 'c-1', created_at: 'today', updated_at: 'today', preview: 'Question' }], limit: 25, offset: 50 };
+    if (args[1].method === 'DELETE') return { status: 'deleted' };
+    return { conversation_id: 'c-1', created_at: 'today', updated_at: 'today', messages: [
+      { message_id: 'm2', role: 'assistant', content: 'Answer', created_at: '2026-10-17T10:02:00Z', status: 'complete' },
+      { message_id: 'm1', role: 'user', content: 'Question', created_at: '2026-10-17T10:01:00Z', status: 'complete' },
+    ] };
+  } } });
+  assert.equal((await api.createConversation()).conversation_id, 'c-1');
+  assert.equal((await api.listConversations({ limit: 25, offset: 50 })).items[0].preview, 'Question');
+  const detail = await api.getConversation('c/1');
+  assert.equal(calls[2][0], 'api/v1/conversations/c%2F1');
+  assert.deepEqual(detail.messages.map(message => message.role), ['user', 'assistant']);
+  assert.deepEqual(await api.deleteConversation('c-1'), { status: 'deleted' });
+  assert.equal(calls[1][0], 'api/v1/conversations?limit=25&offset=50');
+  assert.equal(calls[3][1].method, 'DELETE');
+});
+
 test('uploads one multipart file field without setting Content-Type manually', async () => {
   let call;
   const api = createPrivacyPalApi({ client: { request: async (...args) => {
@@ -75,6 +109,53 @@ test('submits question JSON to the session route and preserves actual workflow f
 
 test('rejects malformed workflow responses without filling missing findings', () => {
   assert.throws(() => mapWorkflowResponse({ workflow_id: 'w', version: 1, question: 'q', draft: 'd' }), error => error.code === 'invalid_response');
+});
+
+test('edits the active draft with the backend workflow route and current version', async () => {
+  let call;
+  const api = createPrivacyPalApi({ client: { request: async (...args) => { call = args; return {
+    workflow_id: 'w-1', version: 2, question: 'Question?', draft: 'Edited exact text', findings: [],
+    residual_review: { status: 'ready_for_user_review', findings: [], reasons: [] }, review_complete: true,
+    acknowledged: false, send_state: 'review', provider: { name: 'Provider', configured: true }, pages_used: [2],
+  }; } } });
+  const controller = new AbortController();
+  const result = await api.updateDraft('s/1', 'w/1', 1, 'Edited exact text', { signal: controller.signal });
+  assert.equal(call[0], 'api/v1/sessions/s%2F1/workflows/w%2F1/draft');
+  assert.equal(call[1].method, 'PATCH');
+  assert.deepEqual(call[1].body, { version: 1, draft: 'Edited exact text' });
+  assert.equal(call[1].signal, controller.signal);
+  assert.equal(result.version, 2);
+  assert.equal(result.draft, 'Edited exact text');
+});
+
+test('acknowledges the current backend workflow version', async () => {
+  let call;
+  const api = createPrivacyPalApi({ client: { request: async (...args) => { call = args; return {
+    workflow_id: 'w-1', version: 1, question: 'Question?', draft: 'Safe text', findings: [],
+    residual_review: { status: 'needs_review', findings: [], reasons: ['Check contextual risk.'] }, review_complete: true,
+    acknowledged: true, send_state: 'review', provider: { name: 'Provider', configured: true }, pages_used: [],
+  }; } } });
+  const result = await api.acknowledgeReview('s-1', 'w-1', 1);
+  assert.equal(call[0], 'api/v1/sessions/s-1/workflows/w-1/acknowledge');
+  assert.equal(call[1].method, 'POST');
+  assert.deepEqual(call[1].body, { version: 1 });
+  assert.equal(result.acknowledged, true);
+});
+
+test('approves the current version without restoring private values and maps the answer response', async () => {
+  let call;
+  const api = createPrivacyPalApi({ client: { request: async (...args) => { call = args; return {
+    workflow_id: 'w-1', version: 3, answer: 'Actual backend answer', send_state: 'sent',
+    provider: { name: 'Provider' }, pages_used: [1, 3], history_saved: true,
+  }; } } });
+  const result = await api.approveWorkflow('s-1', 'w-1', 3);
+  assert.equal(call[0], 'api/v1/sessions/s-1/workflows/w-1/approve');
+  assert.equal(call[1].method, 'POST');
+  assert.deepEqual(call[1].body, { version: 3, restore_placeholders: false });
+  assert.equal(result.answer, 'Actual backend answer');
+  assert.deepEqual(result.pages_used, [1, 3]);
+  const malformed = createPrivacyPalApi({ client: { request: async () => ({ workflow_id: 'w-1', version: 3, answer: 'answer' }) } });
+  await assert.rejects(malformed.approveWorkflow('s-1', 'w-1', 3), error => error.code === 'invalid_response');
 });
 
 test('shows safe backend API errors and network errors without leaking raw bodies', async () => {

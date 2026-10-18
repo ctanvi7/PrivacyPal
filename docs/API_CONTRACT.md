@@ -1,7 +1,7 @@
 ﻿# PrivacyPal API Contract — Draft
 
-Status: Proposal for team review
-Version: MVP draft
+Status: Mixed contract. The numbered flow and examples are the earlier proposal; current conversation routes and current workflow routes are specified in the implemented sections below.
+Version: MVP
 
 ## Purpose
 
@@ -29,12 +29,15 @@ Initial implementation can use synchronous requests. Add polling or streaming on
 
 Creates temporary state for one user’s local app session.
 
+The request body is optional for backward compatibility. When provided, it may contain `{ "conversation_id": "opaque-id" }` to attach the new session to an existing history record. Without it, the backend creates a new conversation and binds it to the session. The response includes `conversation_id` in addition to `session_id` and `expires_in_seconds`.
+
 ### Response — `201 Created`
 
 ```json
 {
   "session_id": "opaque-random-id",
-  "expires_in_seconds": 1800
+  "expires_in_seconds": 1800,
+  "conversation_id": "opaque-conversation-id"
 }
 ```
 
@@ -164,7 +167,7 @@ Explicitly approves the current reviewed version. The backend verifies the activ
 }
 ```
 
-Provider destination disclosure must be available to the user before approval. Its exact response fields and whether approval returns synchronously remain open for team review. If delivery may have occurred but the result is unknown, the backend must report that uncertainty and must not silently retry.
+Provider destination disclosure is required before approval; whether the current UI fully provides it must be verified and is not claimed here. If delivery may have occurred but the result is unknown, the backend must report that uncertainty and must not silently retry.
 
 ## 6. Consistent error response
 
@@ -205,7 +208,10 @@ All messages must be safe for display and must not include stack traces, documen
 - The backend sends only the current draft version that passed required checks and the user explicitly approved. It must reject stale versions and consume approval at most once.
 - High-risk secrets remain blocked from outbound content, even if a model proposes retaining them or the user edits the draft.
 - Never log document contents, extracted text, prompts, findings with raw values, sanitized request bodies, answers, credentials, or placeholder mappings.
-- Use temporary session state. Do not add persistent document or conversation storage through this API contract.
+- Current behavior: sessions and active workflows use temporary process-local state.
+- Implemented: persist successful user questions and confirmed returned AI answers in local SQLite for up to 30 days per message. Detected high-risk credentials are not saved; failed, interrupted, and delivery-uncertain content is not persisted. Do not persist source documents, extracted text, findings, drafts, placeholder mappings, approval payloads, credentials, full provider requests, or failed/unreturned answers.
+- Clearing an active session clears temporary state but leaves saved history unless the user explicitly requests history deletion. Conversation deletion must also clean associated active workflow and temporary document state.
+- SQLite is not encrypted by default. Its planned location is the OS per-user application-data directory, outside the repository and temporary upload directory. Do not add application-managed backups. Local deletion cannot remove content already sent to an external provider. These storage, cleanup, and disclosure behaviors are not yet implemented.
 
 ## Runtime AI requirement
 
@@ -222,6 +228,32 @@ This document is a proposal, not an agreed implementation contract. Members 1 an
 - Provider/model selection, user-visible destination details, provider payload shape, credential configuration, and provider-specific response handling.
 - HTTP status mappings, error codes, and retryability semantics for endpoints beyond session creation and PDF upload, especially provider timeout or uncertain delivery.
 - Whether optional features such as placeholder restoration and source references are in scope and how they fit the API.
+
+## Conversation-history APIs
+
+These endpoints provide local conversation history. They do not replace or alter the existing session, question, draft, acknowledgement, approval, or cancellation routes below.
+
+**Implementation status:** `POST /api/v1/conversations`, `GET /api/v1/conversations`, `GET /api/v1/conversations/{conversation_id}`, and `DELETE /api/v1/conversations/{conversation_id}` are now implemented by the backend. Persistence remains local-only, is not encrypted by SQLite, and these routes do not restore active workflows. The create endpoint returns a new opaque conversation ID. List accepts optional `limit` (1–100, default 50) and `offset` (default 0) query parameters.
+
+### List conversations
+
+`GET /api/v1/conversations`
+
+Returns non-expired conversations ordered by most recent activity as `{ "items": [...], "limit": 50, "offset": 0 }`. Each list item contains `conversation_id`, `created_at`, `updated_at`, and `preview` (up to 120 characters of the earliest retained user question, or `null`). It does not expose documents, drafts, findings, or provider payloads. Expired messages are removed individually after 30 days; later conversation activity does not extend their retention. Empty conversations expire after 30 days of inactivity.
+
+### Retrieve a conversation
+
+`GET /api/v1/conversations/{conversation_id}`
+
+Returns one conversation and its retained messages in chronological order. Message fields are `message_id`, `role` (`user` or `assistant`), `content` (successful question or confirmed returned answer only), `created_at`, and `status`. Detected high-risk credentials are not saved. Failed, interrupted, and delivery-uncertain content is not persisted; no status-only record is currently written. This history is read-only and does not restore an active document, workflow, draft, approval, or session.
+
+### Delete a conversation
+
+`DELETE /api/v1/conversations/{conversation_id}`
+
+Deletes the local conversation and messages, and clears any associated active in-memory workflow, document context, extracted text, mappings, and approval state. The current backend does not create document temp files. Returns `200 { "status": "deleted" }`, `404` if absent/expired, or `503 CONVERSATION_CLEANUP_INCOMPLETE` if active state was cleared but the SQLite deletion failed. Local host/origin protections apply; there is no account or multi-user authorization layer. Deletion cannot recall data already transmitted to an external provider.
+
+The persistent schema is documented in DATABASE.md. SQLite history is not encrypted by default. A successful provider answer is returned even if the subsequent local history write fails; in that case the response includes `history_saved: false` and the chat should not claim persistence.
 
 ## Implemented workflow routes
 
@@ -275,3 +307,7 @@ Document overview requests such as "explain the attached document" select comple
 The initial review now uses two model requests rather than three. Its first native `detect_sensitive_data` call requires both `terms` (1-8 bounded search terms) and `sensitive_spans`. The registry performs bound inspection, then validates and combines source spans with deterministic detection. All five internal operations still complete in order; the final residual audit remains a separate native call receiving only the sanitized draft. A single additional audit is permitted after verified redaction. Missing arguments, invalid source spans, repeated calls, and incomplete output still prevent approval. HTTP routes and review response fields are unchanged. The frontend allows 390 seconds for three bounded model calls plus orchestration.
 
 Backend-only `OLLAMA_KEEP_ALIVE_SECONDS` defaults to 900. The launcher enables content-free adapter diagnostics: stage durations, model load/prompt/generation durations, and token counts. No raw model output or document content is logged. The original audit instructions and reasoning budget are retained.
+
+### Merge integration: completed requests and history
+
+Successful approval responses retain `history_saved` alongside the provider, pages, answer and consumed send state. Both credential scanning and answer grounding run before any restoration, response or history write. Withheld and uncertain answers are never saved. Completion releases source documents, semantic values, mappings and active review text; another question requires a new upload. Session creation returns a conversation ID and an HttpOnly ownership cookie. Session clear and conversation deletion invalidate pending analyses; a provider result already in flight cannot revive cleared state or create a new history entry. Groq model selection remains explicit, and process settings override `backend/.env`, including `PRIVACYPAL_DATABASE_PATH`.

@@ -108,7 +108,9 @@ def test_exact_reviewed_pdf_draft_is_the_only_user_content_sent_to_groq(flow):
     payload = request.content.decode()
     assert all(value not in payload for value in VALUES)
     assert SOURCE not in payload and "placeholder_map" not in payload
-    assert main.sessions.items[sid].document is not None  # Source remains local.
+    assert main.sessions.items[sid].document is None  # Source is released after delivery.
+    history = client.get(f"/api/v1/conversations/{main.sessions.items[sid].conversation_id}", headers=headers).json()
+    assert all(value not in json.dumps(history) for value in VALUES)
     assert client.post(f"{url}/approve", headers=headers, json={"version": review["version"]}).status_code == 409
     assert len(flow[1]) == 1
 
