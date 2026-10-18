@@ -1,95 +1,58 @@
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
+import { getWorkflowStatus } from '../lib/workflowActions.js';
+import DraftTranslation from './DraftTranslation.jsx';
+import SafeMarkdown from './SafeMarkdown.js';
 
-const STATUS_LABELS = {
-  'review-ready': 'Review the backend-provided text and recommendations.',
-  'review-blocked': 'The backend review is incomplete or blocked. Approval is unavailable.',
-  editing: 'Edit the exact outgoing request. Saving changes reruns backend privacy checks.',
-  'saving-edit': 'Saving your edit and rerunning backend privacy checks…',
-  'awaiting-acknowledgement': 'The backend reported remaining review warnings. Acknowledge them before approval.',
-  acknowledging: 'Recording your acknowledgement with the backend…',
-  'awaiting-approval': 'Confirm the exact text below before it is sent to the configured provider.',
-  sending: 'The backend is processing your explicit approval. Do not retry this request.',
-  sent: 'The backend returned an answer for the approved request.',
-  'send-error': 'The approval result failed or is uncertain. Do not retry this workflow.',
-  'review-error': 'This workflow could not be updated. Start a new review before approval.',
-};
+function Icon({ name }) {
+  const paths = {
+    lock: <><rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3m-4 4v3"/></>,
+    send: <><path d="m21 3-7.5 18-3.8-7.7L2 9.5 21 3Z"/><path d="m9.7 13.3 5-5"/></>,
+    edit: <><path d="m15 5 4 4M4 20l4.3-.9L19 8.4a2.8 2.8 0 0 0-4-4L4.3 15.1 4 20Z"/></>,
+  };
+  return <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{paths[name]}</svg>;
+}
 
-const LANGUAGES = [
-  ['hi-IN', 'Hindi'], ['bn-IN', 'Bengali'], ['ta-IN', 'Tamil'], ['te-IN', 'Telugu'],
-  ['mr-IN', 'Marathi'], ['gu-IN', 'Gujarati'], ['kn-IN', 'Kannada'], ['ml-IN', 'Malayalam'],
-  ['pa-IN', 'Punjabi'], ['od-IN', 'Odia'], ['as-IN', 'Assamese'], ['ur-IN', 'Urdu'], ['en-IN', 'English'],
-  ['brx-IN', 'Bodo'], ['doi-IN', 'Dogri'], ['kok-IN', 'Konkani'], ['ks-IN', 'Kashmiri'],
-  ['mai-IN', 'Maithili'], ['mni-IN', 'Manipuri'], ['ne-IN', 'Nepali'], ['sa-IN', 'Sanskrit'],
-  ['sat-IN', 'Santali'], ['sd-IN', 'Sindhi'],
-];
+export default function PrivacyReviewPanel({ response, busy = false, error = '', onEdit, onAcknowledge, onApprove, onCancel, sarvamAvailable = false, onTranslate, onUseTranslation }) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(response.draft);
+  const residual = response.residual_review || {};
+  const providerConfigured = response.provider?.configured === true;
+  const residualReviewable = ['ready_for_user_review', 'needs_review'].includes(residual.status);
+  const needsWarningAck = residual.status === 'needs_review' && !response.acknowledged;
+  const canApprove = providerConfigured && response.review_complete && residualReviewable && !needsWarningAck && response.send_state === 'review' && !busy;
+  const disabledReason = !providerConfigured
+    ? 'Approval is unavailable because the answer provider is not configured.'
+    : residual.status === 'blocked' ? 'Approval is blocked until identifying details are removed or replaced and the request is rechecked.'
+      : !response.review_complete ? 'Approval is unavailable until all privacy checks are complete.'
+        : !residualReviewable ? 'Approval is unavailable because the remaining-clue check is incomplete.'
+        : needsWarningAck ? 'Review and acknowledge the remaining privacy warning before approval.'
+          : response.send_state !== 'review' ? `Approval is unavailable while this review is ${response.send_state}.` : '';
+  const answer = response.send_state === 'answer_withheld' ? null : response.answer;
+  const status = getWorkflowStatus(response);
 
-export default function PrivacyReviewPanel({ state, controller, onRestart, onTranslate, onUseTranslation, sarvamAvailable = false }) {
-  const [targetLanguage, setTargetLanguage] = useState('hi-IN');
-  const [sourceLanguage, setSourceLanguage] = useState('en-IN');
-  const [translationConsent, setTranslationConsent] = useState(false);
-  const [translation, setTranslation] = useState(null);
-  const [translationBusy, setTranslationBusy] = useState(false);
-  const [translationError, setTranslationError] = useState('');
-  useEffect(() => { setTranslation(null); setTranslationConsent(false); setTranslationError(''); }, [state?.backendResponse?.version]);
-  if (!state?.review || !state.backendResponse) return null;
-  const response = state.backendResponse;
-  const editing = state.status === 'editing';
-  const busy = ['saving-edit', 'acknowledging', 'sending'].includes(state.status);
-  const canEdit = ['review-ready', 'review-blocked', 'awaiting-acknowledgement', 'awaiting-approval'].includes(state.status);
-  const canContinue = state.status === 'review-ready';
-  const canAcknowledge = state.status === 'awaiting-acknowledgement';
-  const awaitingApproval = state.status === 'awaiting-approval';
-  const sarvamSelected = sarvamAvailable;
-
-  async function translateCurrentDraft() {
-    setTranslationBusy(true); setTranslationError(''); setTranslation(null);
-    try { setTranslation(await onTranslate(sourceLanguage, targetLanguage)); }
-    catch (error) { setTranslationError(error?.message || 'Translation failed. No fallback provider was used.'); }
-    finally { setTranslationBusy(false); }
+  async function saveDraft() {
+    const updated = await onEdit(draft);
+    if (updated) { setDraft(updated.draft); setEditing(false); }
   }
 
-  return <section className="review-card glass-panel" aria-labelledby="backend-review-title" aria-busy={busy}>
-    <div className="review-top"><span className="review-lock" aria-hidden="true">✓</span><div className="review-title"><h2 id="backend-review-title">Local privacy review</h2><p>{STATUS_LABELS[state.status] || 'Review the backend-provided request.'}</p></div></div>
-    <section aria-labelledby="backend-question-title"><h3 id="backend-question-title">Your question</h3><p>{state.review.originalRequestText}</p></section>
-    <section aria-labelledby="backend-findings-title"><h3 id="backend-findings-title">Privacy recommendations returned by the backend</h3>
-      {state.review.recommendations.length ? <ul>{state.review.recommendations.map((item, index) => <li key={`${item.action}-${item.item}-${index}`}>
-        <strong>{item.action.toUpperCase()}</strong> {item.item}<p>{item.reason}</p>
-      </li>)}</ul> : <p>The backend returned no privacy findings.</p>}
-    </section>
-    <section aria-labelledby="backend-risk-title"><h3 id="backend-risk-title">Remaining risk review</h3><p>Backend status: <strong>{response.residual_review.status}</strong></p>
-      {state.review.riskFlags.length ? <ul>{state.review.riskFlags.map((flag, index) => <li key={`${flag.label}-${index}`}>
-        <strong>{flag.label}</strong>{flag.description && <p>{flag.description}</p>}
-      </li>)}</ul> : <p>The backend returned no remaining risk flags.</p>}
-    </section>
-    <section aria-labelledby="backend-proposed-title"><h3 id="backend-proposed-title">Proposed outgoing request</h3><pre className="request-preview">{state.review.proposedOutgoingText}</pre></section>
-    <section aria-labelledby="review-final-text-title"><h3 id="review-final-text-title">Exact text to be sent</h3>
-      <label className="visually-hidden" htmlFor="backend-final-request">Exact final outgoing request</label>
-      <textarea id="backend-final-request" className="request-preview" value={state.exactOutgoingText} readOnly={!editing} onChange={event => controller.updateOutgoingText(event.target.value)} />
-    </section>
-
-    {sarvamSelected && <section className="sarvam-translation" aria-labelledby="sarvam-request-translation-title">
-      <h3 id="sarvam-request-translation-title">Translate this reviewed request with Sarvam</h3>
-      <p>Sarvam receives the exact sanitized request shown above. Your document and placeholder mappings stay local. This does not approve or send an answer request.</p>
-      <label>Source language <select value={sourceLanguage} onChange={event => setSourceLanguage(event.target.value)}>{LANGUAGES.map(([code, name]) => <option key={code} value={code}>{name}</option>)}</select></label>
-      <label>Translation language <select value={targetLanguage} onChange={event => setTargetLanguage(event.target.value)}>{LANGUAGES.map(([code, name]) => <option key={code} value={code}>{name}</option>)}</select></label>
-      <label className="sarvam-consent"><input type="checkbox" checked={translationConsent} onChange={event => setTranslationConsent(event.target.checked)}/> I understand this reviewed text will be sent to Sarvam for translation.</label>
-      <button type="button" className="edit-button" disabled={!translationConsent || translationBusy || busy || ['sending', 'sent'].includes(state.status)} onClick={() => void translateCurrentDraft()}>{translationBusy ? 'Translating…' : 'Translate reviewed request'}</button>
-      {translationError && <p role="alert">{translationError}</p>}
-      {translation?.translated_text && <><label htmlFor="translated-request-preview">Translation preview — review it before use</label><textarea id="translated-request-preview" className="request-preview" readOnly value={translation.translated_text}/><button type="button" className="edit-button" onClick={() => { onUseTranslation(translation.translated_text); setTranslation(null); setTranslationConsent(false); }}>Use translation and rerun privacy checks</button></>}
-    </section>}
-
-    <p className="review-footnote">Workflow {response.workflow_id} · version {response.version} · pages used: {response.pages_used.length ? response.pages_used.join(', ') : 'none reported'} · provider: {response.provider.name || 'not supplied'} ({response.provider.configured ? 'configured' : 'not configured'}){response.provider.endpoint ? ` · ${response.provider.endpoint}` : ''}</p>
-    {state.error && <p className="notice" role="alert">{state.error.message}</p>}
+  return <section className="review-card glass-panel" aria-labelledby="review-title">
+    <div className="review-top"><span className="review-lock"><Icon name="lock"/></span><div className="review-title"><h2 id="review-title">{response.send_state === 'sent' ? 'Answer received' : response.send_state === 'answer_withheld' ? 'Answer withheld' : response.send_state === 'delivery_unknown' ? 'Answer provider failed' : 'Review before sending'}</h2><p>{status.detail}</p></div><span className={`risk-pill state-${residual.status || 'pending'}`}><i/>{status.label}</span></div>
+    <p className="provider-line">{providerConfigured ? `Answer provider: ${response.provider.name}` : `Answer provider ${response.provider?.name || ''} is not configured`}{response.provider?.endpoint && <small> · {response.provider.endpoint}</small>}</p>
+    {error && <p className="notice" role="alert">{error}</p>}
+    {answer && <section className="answer-result" aria-label="Provider answer" aria-live="polite"><div className="answer-label">Answer</div><SafeMarkdown>{answer}</SafeMarkdown><small>{response.provider?.name || 'Provider'}{Array.isArray(response.pages_used) && response.pages_used.length ? ` · pages ${response.pages_used.join(', ')}` : ''}</small></section>}
+    <details className="request-disclosure" open={!answer || editing}>
+      <summary><span>Exact request to be sent</span><small>Version {response.version}</small></summary>
+      <p className="request-caption">Inspect the exact text {answer ? 'approved for this answer' : 'before approving'}. The original document is not attached.</p>
+      {editing ? <><label className="visually-hidden" htmlFor="sanitized-request">Exact sanitized request</label><textarea id="sanitized-request" className="request-preview request-editor" value={draft} readOnly={busy} onChange={event => setDraft(event.target.value)} /></>
+        : <div className="request-preview" role="region" aria-label="Exact sanitized request" tabIndex={0}>{response.draft}</div>}
+    </details>
+    {sarvamAvailable && !editing && response.send_state === 'review' && <DraftTranslation response={response} busy={busy} onTranslate={onTranslate} onUseTranslation={onUseTranslation}/>}
     <div className="review-actions">
-      {canEdit && !editing && <button className="edit-button" type="button" disabled={busy} onClick={() => controller.beginEditing()}>Edit request</button>}
-      {editing && <button className="edit-button" type="button" disabled={busy} onClick={() => void controller.finishEditing()}>Save and recheck request</button>}
-      {canContinue && <button className="approve-button" type="button" disabled={!response.review_complete || response.residual_review.status === 'blocked'} onClick={() => controller.confirmReview()}>Continue to approval</button>}
-      {canAcknowledge && <button className="approve-button" type="button" disabled={busy} onClick={() => void controller.acknowledge()}>Acknowledge warnings</button>}
-      {awaitingApproval && <button className="approve-button" type="button" disabled={!controller.canApprove || busy} onClick={() => void controller.approve()}>Approve exact text &amp; send</button>}
-      {awaitingApproval && !response.provider.configured && <p className="review-footnote">The backend has no configured answer provider. Nothing can be sent until it is configured.</p>}
-      {state.status === 'review-blocked' && <p className="review-footnote">Approval is blocked by the backend review. Edit the request to run checks again.</p>}
-      {state.status === 'send-error' && <p className="review-footnote">This approval cannot be retried. Check provider delivery status before starting a new request.</p>}
-      {['review-error', 'send-error'].includes(state.status) && <button className="edit-button" type="button" onClick={onRestart}>Start a new review</button>}
+      {editing ? <><button className="approve-button" type="button" onClick={saveDraft} disabled={busy || !draft.trim()}>{busy ? 'Checking…' : 'Save and recheck'}</button><button className="edit-button" type="button" onClick={() => { setDraft(response.draft); setEditing(false); }} disabled={busy}>Discard edits</button></>
+        : <><button className="approve-button" type="button" onClick={onApprove} disabled={!canApprove}><Icon name="send"/>{busy ? 'Working…' : response.send_state === 'sent' ? 'Answer received' : response.send_state === 'answer_withheld' ? 'Answer withheld' : response.send_state === 'delivery_unknown' ? 'Provider delivery failed' : 'Approve & get answer'}</button><button className="edit-button" type="button" onClick={() => { setDraft(response.draft); setEditing(true); }} disabled={busy || !!answer || response.send_state !== 'review'}><Icon name="edit"/>Edit request</button></>}
     </div>
+    {!editing && <p className={`review-footnote ${canApprove ? 'approval-ready' : ''}`}><span className="info-icon">i</span>{canApprove ? 'Only this exact text will be sent after your approval.' : disabledReason || 'The request has already been submitted.'}</p>}
+    {needsWarningAck && <button className="acknowledge-button" type="button" onClick={onAcknowledge} disabled={busy}>I reviewed the remaining warning</button>}
+    {!answer && response.send_state === 'review' && <button className="cancel-review" type="button" onClick={onCancel} disabled={busy}>Cancel review</button>}
   </section>;
 }

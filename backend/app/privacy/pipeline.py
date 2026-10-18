@@ -53,6 +53,7 @@ class SelectedContent:
     source_sentence_count: int
     selected_sentence_count: int
     status: Literal["selected", "no_relevant_content"]
+    source_spans: tuple[tuple[int, int], ...] = field(default=(), repr=False)
 
 
 @dataclass(frozen=True)
@@ -62,6 +63,7 @@ class SanitizedDraft:
     selection_status: Literal["selected", "no_relevant_content"]
     # This mapping is session-only and must never be serialized or logged.
     placeholder_map: dict[str, str] = field(repr=False)
+    source_spans: tuple[tuple[int, int], ...] = field(default=(), repr=False)
 
     def public_view(self) -> dict[str, object]:
         return {"text": self.text, "findings": [item.public_view() for item in self.findings], "selection_status": self.selection_status}
@@ -78,6 +80,14 @@ class ResidualReview:
 
 
 _PATTERNS: tuple[tuple[str, Action, str, re.Pattern[str]], ...] = (
+    ("person_name", "mask", "A labeled resident or personal name is masked by default.",
+     re.compile(r"(?im)\b(?:resident|tenant|applicant|full\s+name|name)(?:['’]s)?(?:\s+name)?[ \t]*[:=-][ \t]*([^\n,;:\[\]]{2,100})")),
+    ("street_address", "mask", "An exact labeled address is masked by default.",
+     re.compile(r"(?im)\b(?:(?:exact|postal|home|residential|property|mailing|street)\s+)?address[ \t]*[:=-][ \t]*([^\n\[\]]{3,200}?)(?=[ \t]*(?:$|\n|\b(?:lease(?:/reference)?(?:[ \t]+(?:number|no\.?|id))?|reference(?:[ \t]+(?:number|no\.?|id))?|maintenance[ \t]+issue|issue|problem|email|phone|contact|resident|tenant)[ \t]*[:=]))")),
+    ("street_address", "mask", "A street-address pattern is masked by default.",
+     re.compile(r"(?i)\b\d{1,6}[ \t]+(?:[A-Z0-9.'’-]+[ \t]+){1,6}(?:street|st|road|rd|avenue|ave|lane|ln|drive|dr|court|ct|way|boulevard|blvd)\b(?:[.,]?[ \t]+(?:apt\.?|apartment|unit|suite|flat)[ \t#]*[A-Z0-9-]+)?")),
+    ("lease_reference", "mask", "A lease or reference identifier is masked by default.",
+     re.compile(r"(?i)\b(?:lease(?:/reference)?|reference|ref|tenancy)\s*(?:(?:number|no\.?|id)\s*)?[:#=-]\s*([A-Z0-9][A-Z0-9/-]{2,})")),
     ("credential", "block", "A credential-like value must not be included in an outbound draft.",
      re.compile(r"(?i)\b(?:password|passwd|passcode|api[_ -]?key|access[_ -]?token|refresh[_ -]?token|client[_ -]?secret|secret[_ -]?key)\b\s*[:=]\s*['\"]?([A-Za-z0-9_./+=-]{1,512})")),
     ("credential", "block", "A recognized private key or provider token must not be sent.",
@@ -114,15 +124,23 @@ def _luhn_valid(value: str) -> bool:
     return checksum % 10 == 0
 
 
-def scan_sensitive_data(text: str) -> ScanResult:
+def scan_sensitive_data(text: str, *, additional_findings: tuple[Finding, ...] = ()) -> ScanResult:
     """Find common patterns; absence of findings is not a guarantee of safety."""
     if not isinstance(text, str) or len(text) > MAX_ANALYSIS_CHARS:
         raise PrivacyCheckError("Privacy scan input is invalid or exceeds the configured limit.")
     candidates = []
     priority = {"block": 0, "omit": 1, "mask": 2}
+    for finding in additional_findings:
+        # Find validated source values again after relevance selection changes offsets.
+        pattern = re.compile(r"\s+".join(re.escape(part) for part in finding._value.split()))
+        for match in pattern.finditer(text):
+            candidates.append((priority[finding.action], finding.category, finding.action,
+                finding.reason, match.start(), match.end(), match.group()))
+        if len(candidates) > MAX_FINDINGS:
+            raise PrivacyCheckError("The privacy scan produced too many findings to review safely.")
     for category, action, reason, pattern in _PATTERNS:
         for match in pattern.finditer(text):
-            has_value_group = category == "account_identifier" and match.lastindex and match.group(1) is not None
+            has_value_group = category in {"account_identifier", "person_name", "lease_reference", "street_address"} and match.lastindex and match.group(1) is not None
             start, end = match.span(1) if has_value_group else match.span()
             value = text[start:end]
             if category == "payment_card" and not _luhn_valid(value):
@@ -150,29 +168,68 @@ def scan_sensitive_data(text: str) -> ScanResult:
 
 _WORD = re.compile(r"[a-z0-9]{2,}", re.IGNORECASE)
 _STOP_WORDS = {"about", "after", "also", "and", "are", "can", "does", "for", "from", "how", "into", "its", "more", "need", "not", "that", "the", "their", "there", "these", "they", "this", "was", "what", "when", "where", "which", "who", "will", "with"}
+_BROAD_DOCUMENT_TERMS = {"document", "doc", "file", "attachment", "attached", "pdf", "text", "report", "receipt", "invoice"}
+_BROAD_DOCUMENT_REQUEST_TERMS = {"describe", "explain", "overview", "summarize", "summarise", "summary"}
+_BROAD_REQUEST_FILLER_TERMS = {
+    "please", "kindly", "me", "us", "you", "could", "would", "it", "those",
+    "in", "of", "to", "is", "an", "simple", "plain", "english", "terms",
+    "words", "brief", "briefly", "detail", "details", "simply", "language",
+}
 
 
 def _terms(text: str) -> set[str]:
     return {word.casefold() for word in _WORD.findall(text) if word.casefold() not in _STOP_WORDS}
 
 
-def select_relevant_content(question: str, source_text: str, *, max_chars: int = MAX_DRAFT_CHARS) -> SelectedContent:
+def _is_broad_document_request(question: str) -> bool:
+    if re.fullmatch(r"\s*(?:please\s+)?what\s+(?:is|are)\s+(?:this|that|it|these|those)\s+about[\s.!?]*", question, flags=re.IGNORECASE):
+        return True
+    terms = _terms(question)
+    if not terms & _BROAD_DOCUMENT_REQUEST_TERMS:
+        return False
+    if terms & _BROAD_DOCUMENT_TERMS:
+        return True
+    # With a document already bound to the workflow, "explain this please"
+    # refers to that document. Only generic request/filler words qualify;
+    # topic-bearing questions must still select matching passages.
+    return not (terms - _BROAD_DOCUMENT_REQUEST_TERMS - _BROAD_REQUEST_FILLER_TERMS)
+
+
+def select_relevant_content(question: str, source_text: str, *, max_chars: int = MAX_DRAFT_CHARS, search_terms: tuple[str, ...] = ()) -> SelectedContent:
     """Select matching sentences in source order; do not guess if none match."""
     if not isinstance(question, str) or not isinstance(source_text, str) or len(question) > MAX_QUESTION_CHARS or len(source_text) > MAX_ANALYSIS_CHARS:
         raise PrivacyCheckError("Question or source content is invalid or exceeds the configured limit.")
     if not 1 <= max_chars <= MAX_DRAFT_CHARS:
         raise PrivacyCheckError("Selected-content limit is invalid.")
+    if not isinstance(search_terms, tuple) or len(search_terms) > 8 or any(not isinstance(term, str) or not term.strip() or len(term) > 100 for term in search_terms):
+        raise PrivacyCheckError("Document search terms are invalid.")
     # Split after sentence punctuation only when followed by whitespace and a
     # plausible sentence start; this avoids cutting email addresses at dots.
-    sentences = [
-        sentence.strip()
-        for sentence in re.split(r"(?<=[.!?])\s+(?=[A-Z0-9\"'])|\n+", source_text)
-        if sentence.strip()
-    ]
+    sentences = []
+    spans = []
+    offset = 0
+    for part in re.split(r"(?<=[.!?])\s+(?=[A-Z0-9\"'])|\n+", source_text):
+        # Locate each nonempty sentence in the original source for page attribution.
+        if part and part.strip():
+            sentence = part.strip()
+            start = source_text.index(sentence, offset)
+            sentences.append(sentence)
+            spans.append((start, start + len(sentence)))
+            offset = start + len(sentence)
     query_terms = _terms(question)
+    # Native tool terms can bridge wording such as "owe" to "total due".
+    # Only exact terms actually present in this bound source contribute.
+    for term in search_terms:
+        if term.casefold() in source_text.casefold():
+            query_terms.update(_terms(term))
     scored = [(len(query_terms & _terms(sentence)), index, sentence) for index, sentence in enumerate(sentences)]
-    scored = [item for item in scored if item[0] > 0]
-    scored.sort(key=lambda item: (-item[0], item[1]))
+    if _is_broad_document_request(question):
+        # Overview requests need document content even if a heading happens to
+        # match "document" or "attached". Keep complete sentences in source order.
+        scored = [(1, index, sentence) for index, sentence in enumerate(sentences)]
+    else:
+        scored = [item for item in scored if item[0] > 0]
+        scored.sort(key=lambda item: (-item[0], item[1]))
     chosen: set[int] = set()
     used = 0
     for _, index, sentence in scored:
@@ -181,13 +238,16 @@ def select_relevant_content(question: str, source_text: str, *, max_chars: int =
             chosen.add(index)
             used += addition
     selected = " ".join(sentence for index, sentence in enumerate(sentences) if index in chosen)
-    return SelectedContent(selected, len(sentences), len(chosen), "selected" if chosen else "no_relevant_content")
+    return SelectedContent(selected, len(sentences), len(chosen), "selected" if chosen else "no_relevant_content",
+        tuple(span for index, span in enumerate(spans) if index in chosen))
 
 
-def _apply_actions(text: str, findings: tuple[Finding, ...], actions: dict[str, str]) -> tuple[str, dict[str, str]]:
+def _apply_actions(text: str, findings: tuple[Finding, ...], actions: dict[str, str], *, existing_mapping: dict[str, str] | None = None, source_spans: list[tuple[int, int]] | None = None) -> tuple[str, dict[str, str]]:
     replacements = []
-    mapping: dict[str, str] = {}
-    placeholders: dict[tuple[str, str], str] = {}
+    mapping: dict[str, str] = dict(existing_mapping or {})
+    placeholders: dict[tuple[str, str], str] = {
+        (token[1:].rsplit("_", 1)[0].casefold(), value.casefold()): token for token, value in mapping.items()
+    }
     for finding in findings:
         requested = actions.get(finding.finding_id)
         if requested not in {None, "mask", "omit", "keep"}:
@@ -207,31 +267,72 @@ def _apply_actions(text: str, findings: tuple[Finding, ...], actions: dict[str, 
         replacements.append((finding.start, finding.end, replacement))
     for start, end, replacement in sorted(replacements, reverse=True):
         text = text[:start] + replacement + text[end:]
+        if source_spans is not None:
+            original_span = (source_spans[start][0], source_spans[end - 1][1])
+            source_spans[start:end] = [original_span] * len(replacement)
     return text, mapping
 
 
-def build_sanitized_draft(question: str, source_text: str, *, actions: dict[str, str] | None = None, max_chars: int = MAX_DRAFT_CHARS) -> SanitizedDraft:
+def build_sanitized_draft(question: str, source_text: str, *, actions: dict[str, str] | None = None, max_chars: int = MAX_DRAFT_CHARS, additional_findings: tuple[Finding, ...] = (), search_terms: tuple[str, ...] = ()) -> SanitizedDraft:
     """Build a minimized draft; block/omit known secrets regardless of model advice."""
     if not isinstance(question, str) or not question.strip() or len(question) > MAX_QUESTION_CHARS:
         raise PrivacyCheckError("A valid question is required to build a draft.")
     if actions is not None and not isinstance(actions, dict):
         raise PrivacyCheckError("Proposed finding actions are malformed.")
+    if not isinstance(source_text, str) or len(source_text) > MAX_ANALYSIS_CHARS:
+        raise PrivacyCheckError("Source content is invalid or exceeds the configured limit.")
     prefix = f"Question: {question.strip()}\n\nRelevant context:\n"
     context_limit = max_chars - len(prefix)
     if context_limit < 1:
         raise PrivacyCheckError("The draft limit is too small for this question.")
-    selected = select_relevant_content(question, source_text, max_chars=context_limit)
+    source_findings: tuple[Finding, ...] = ()
+    source_mapping: dict[str, str] = {}
+    selection_source = source_text
+    source_spans = [(index, index + 1) for index in range(len(source_text))]
+    if additional_findings:
+        # PDF selection splits at line breaks. Redact whole verified source spans
+        # first so it cannot leave half a multiline name/address in the draft.
+        source_findings = scan_sensitive_data(source_text, additional_findings=additional_findings).findings
+        selection_source, source_mapping = _apply_actions(source_text, source_findings, {}, source_spans=source_spans)
+    selected = select_relevant_content(question, selection_source, max_chars=context_limit, search_terms=search_terms)
+    if selected.status != "selected":
+        raise PrivacyCheckError("No document context fits in the sanitized request.")
+    draft_spans = [(-1, -1)] * len(prefix)
+    for index, (start, end) in enumerate(selected.source_spans):
+        if index:
+            draft_spans.append((-1, -1))  # Space joining selected sentences.
+        draft_spans.extend(source_spans[start:end])
     # Select only whole sentences that fit. Never slice through a sensitive value.
     draft = prefix + selected.text
-    scan = scan_sensitive_data(draft)
+    scan = scan_sensitive_data(draft, additional_findings=additional_findings)
     unknown_actions = set(actions or {}) - {item.finding_id for item in scan.findings}
     if unknown_actions:
         raise PrivacyCheckError("A proposed action refers to an unknown finding.")
-    sanitized, mapping = _apply_actions(draft, scan.findings, actions or {})
+    sanitized, mapping = _apply_actions(draft, scan.findings, actions or {}, existing_mapping=source_mapping,
+        source_spans=draft_spans)
     residual = scan_sensitive_data(sanitized)
     if any(item.action == "block" for item in residual.findings):
         raise PrivacyCheckError("A high-risk value remains after sanitization.")
-    return SanitizedDraft(sanitized, scan.findings, selected.status, mapping)
+    selected_spans: list[tuple[int, int]] = []
+    for char, (start, end) in zip(sanitized, draft_spans):
+        if start < 0 or not char.strip():
+            continue
+        if selected_spans and start <= selected_spans[-1][1]:
+            selected_spans[-1] = (selected_spans[-1][0], max(end, selected_spans[-1][1]))
+        else:
+            selected_spans.append((start, end))
+    if not selected_spans:
+        raise PrivacyCheckError("No document context remains after sanitization.")
+    if len(sanitized) > max_chars:
+        raise PrivacyCheckError("The sanitized request exceeds the draft limit.")
+    return SanitizedDraft(sanitized, source_findings + scan.findings, selected.status, mapping, tuple(selected_spans))
+
+
+def redact_remaining_values(draft: SanitizedDraft, findings: tuple[Finding, ...]) -> SanitizedDraft:
+    """Apply only verified remaining spans; the changed draft needs a fresh review."""
+    scan = scan_sensitive_data(draft.text, additional_findings=findings)
+    text, mapping = _apply_actions(draft.text, scan.findings, {}, existing_mapping=draft.placeholder_map)
+    return SanitizedDraft(text, draft.findings + scan.findings, draft.selection_status, mapping, draft.source_spans)
 
 
 _CONTEXT_FLAG_REASONS = {

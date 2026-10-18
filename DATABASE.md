@@ -1,5 +1,10 @@
 # PrivacyPal Database and Session Data Design
 
+> Authorized AWS demo mode retains process-local in-memory sessions on one EC2
+> backend, shared by all Lambda gateway invocations. No document database or
+> persistent history is added. AWS processes uploads; restarting the backend
+> loses sessions. See [the deployment runbook](deploy/aws/README.md).
+
 ## 1. Purpose and decision
 
 This document defines how the MVP stores and clears application data. It accompanies ARCHITECTURE.md, SECURITY.md, the product requirements, and design.md.

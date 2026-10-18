@@ -71,6 +71,7 @@ def test_delete_conversation_clears_associated_active_session(client: TestClient
         touched_at=time.monotonic(),
         conversation_id=session["conversation_id"],
     )
+    workflow = active_session.workflow
     sessions.items[session_id] = active_session
     deleted = client.delete(
         f"/api/v1/conversations/{session['conversation_id']}", headers=ORIGIN
@@ -79,9 +80,10 @@ def test_delete_conversation_clears_associated_active_session(client: TestClient
     assert session_id not in sessions.items
     assert active_session.document is None
     assert active_session.document_id is None
-    assert active_session.workflow.question == ""
-    assert active_session.workflow.draft == ""
-    assert active_session.workflow.placeholder_map == {}
+    assert active_session.workflow is None
+    assert workflow.question == ""
+    assert workflow.draft == ""
+    assert workflow.placeholder_map == {}
 
 
 @pytest.mark.parametrize("operation", ["remove_document", "clear_session"])

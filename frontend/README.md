@@ -20,7 +20,7 @@ The empty chat supports selecting a document, uploading it to the local backend,
 
 The browser creates a runtime session before upload. The document is marked uploaded only after the response includes a document ID. Question analysis requires that confirmed document and passes through the actual workflow response. The privacy panel shows the backend's proposed draft, findings, residual review, and metadata as read-only. This question route runs local privacy analysis; it does not send an external answer request.
 
-The API base URL can be set with `VITE_PRIVACYPAL_API_BASE_URL` in the Vite environment. The default is `http://127.0.0.1:8000`, verified against `backend/app/config.py` (`APP_HOST`/`APP_PORT` defaults) and `LOCAL_SETUP.md`. Vite variables are public build-time configuration; set only a URL, never credentials. The backend CORS origin defaults to `http://127.0.0.1:5173` (`FRONTEND_ORIGIN`). If those backend settings are changed, configure the frontend URL and allowed origin to match.
+The API base URL can be set with `VITE_PRIVACYPAL_API_BASE_URL` in the Vite environment. By default, the frontend uses the matching loopback hostname on port 8000 (`localhost` for a `localhost` UI, otherwise `127.0.0.1`) so session cookies remain same-site. Vite variables are public build-time configuration; set only a URL, never credentials. The backend CORS origin defaults to `http://127.0.0.1:5173` (`FRONTEND_ORIGIN`) and accepts its `localhost`/`127.0.0.1` alias on the same port. If those backend settings are changed, configure the frontend URL and allowed origin to match.
 
 Transport errors use backend safe `{ error: { code, message, retryable } }` responses when the message passes a safety check; otherwise a user-safe status message is shown. Network errors, cancellation, timeout, retry, and duplicate-submit states are handled by the shared API client/controllers. Upload progress is shown as an uploading state because the browser Fetch API used here does not report upload progress.
 
@@ -35,3 +35,7 @@ npm.cmd run build
 ## Next integration milestone
 
 The backend also currently implements workflow draft editing, acknowledgement, approval, and answer delivery routes. Those are intentionally not connected by this prompt. They need a separate integration step and tests before the UI offers those operations. The root `docs/API_CONTRACT.md` is still labeled a draft and contains older route examples; use the actual route implementations in `backend/app/main.py` as the source of truth.
+
+## Sarvam language and speech
+
+The current UI preserves the liquid-glass review, per-stage privacy status, and saved-history navigation. With a backend `SARVAM_API_KEY`, it also offers a provider selector, optional voice dictation/audio transcription, a separately consented draft-translation preview with rechecking, and translation/read-aloud tools for the returned answer. Keys are never frontend configuration. See `LOCAL_SETUP.md` for limits, consent, models, and setup.

@@ -1,11 +1,17 @@
 """Minimal runtime configuration for the local FastAPI service."""
 
 from dataclasses import dataclass, field
+from collections.abc import Mapping
 import ipaddress
 import math
 import os
 from pathlib import Path
 from urllib.parse import urlparse
+
+from dotenv import dotenv_values
+
+BACKEND_ENV_FILE = Path(__file__).resolve().parents[1] / ".env"
+GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 
 
 @dataclass(frozen=True)
@@ -13,6 +19,8 @@ class Settings:
     """Settings needed to run the backend foundation locally."""
 
     host: str = "127.0.0.1"
+    deployment_mode: str = "local"
+    proxy_token: str = field(default="", repr=False)
     port: int = 8000
     pdf_max_bytes: int = 10 * 1024 * 1024
     pdf_max_pages: int = 25
@@ -22,8 +30,9 @@ class Settings:
     gemma_model: str = "gemma4:e4b"
     frontend_origin: str = "http://127.0.0.1:5173"
     model_timeout_seconds: float = 120.0
-    answer_provider_name: str = "OpenAI-compatible provider"
-    answer_provider_url: str = ""
+    ollama_keep_alive_seconds: int = 900
+    answer_provider_name: str = "Groq"
+    answer_provider_url: str = GROQ_BASE_URL
     answer_provider_model: str = ""
     answer_provider_api_key: str = field(default="", repr=False)
     answer_provider_timeout_seconds: float = 30.0
@@ -46,8 +55,8 @@ def _default_database_path() -> Path:
     return base / "PrivacyPal" / "conversations.sqlite3"
 
 
-def _positive_int(name: str, default: int) -> int:
-    raw_value = os.getenv(name, str(default))
+def _positive_int(env: Mapping[str, str], name: str, default: int) -> int:
+    raw_value = env.get(name, str(default))
     try:
         value = int(raw_value)
     except ValueError as exc:
@@ -57,8 +66,8 @@ def _positive_int(name: str, default: int) -> int:
     return value
 
 
-def _positive_float(name: str, default: float) -> float:
-    raw_value = os.getenv(name, str(default))
+def _positive_float(env: Mapping[str, str], name: str, default: float) -> float:
+    raw_value = env.get(name, str(default))
     try:
         value = float(raw_value)
     except ValueError as exc:
@@ -69,17 +78,25 @@ def _positive_float(name: str, default: float) -> float:
 
 
 def get_settings() -> Settings:
-    """Load settings from the environment and enforce loopback binding."""
+    """Load backend/.env with process precedence, without mutating os.environ."""
 
-    host = os.getenv("APP_HOST", "127.0.0.1")
+    file_values = dotenv_values(BACKEND_ENV_FILE, interpolate=False, encoding="utf-8-sig")
+    env = {**{key: value for key, value in file_values.items() if value is not None}, **os.environ}
+    deployment_mode = env.get("DEPLOYMENT_MODE", "local")
+    if deployment_mode not in {"local", "aws"}:
+        raise ValueError("DEPLOYMENT_MODE must be local or aws")
+    proxy_token = env.get("PRIVACYPAL_PROXY_TOKEN", "")
+    if deployment_mode == "aws" and len(proxy_token) < 32:
+        raise ValueError("AWS mode requires a private proxy token of at least 32 characters")
+    host = env.get("APP_HOST", "127.0.0.1")
     try:
         address = ipaddress.ip_address(host)
     except ValueError as exc:
         raise ValueError("APP_HOST must be a loopback IP address") from exc
-    if not address.is_loopback:
+    if not address.is_loopback and not (deployment_mode == "aws" and str(address) == "0.0.0.0"):
         raise ValueError("APP_HOST must be a loopback IP address")
 
-    raw_port = os.getenv("APP_PORT", "8000")
+    raw_port = env.get("APP_PORT", "8000")
     try:
         port = int(raw_port)
     except ValueError as exc:
@@ -87,70 +104,66 @@ def get_settings() -> Settings:
     if not 1 <= port <= 65535:
         raise ValueError("APP_PORT must be an integer from 1 to 65535")
 
-    ollama_base_url = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
+    ollama_base_url = env.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
     ollama = urlparse(ollama_base_url)
     if ollama.scheme != "http" or ollama.hostname not in {"127.0.0.1", "localhost", "::1"} or ollama.username or ollama.password:
         raise ValueError("OLLAMA_BASE_URL must be a loopback HTTP URL")
-    frontend_origin = os.getenv("FRONTEND_ORIGIN", "http://127.0.0.1:5173")
+    frontend_origin = env.get("FRONTEND_ORIGIN", "http://127.0.0.1:5173")
     origin = urlparse(frontend_origin)
     if origin.scheme != "http" or origin.hostname not in {"127.0.0.1", "localhost", "::1"} or not origin.port or origin.path not in {"", "/"} or origin.username or origin.password:
         raise ValueError("FRONTEND_ORIGIN must be a local HTTP origin with a port")
 
-    groq_api_key = os.getenv("GROQ_API_KEY", "")
-    provider_name = os.getenv(
-        "ANSWER_PROVIDER_NAME", "Groq" if groq_api_key else "OpenAI-compatible provider"
-    ).strip()
-    provider_url = os.getenv(
-        "ANSWER_PROVIDER_URL",
-        "https://api.groq.com/openai/v1/chat/completions" if groq_api_key else "",
-    ).strip()
-    provider_model = os.getenv(
-        "ANSWER_PROVIDER_MODEL", "openai/gpt-oss-120b" if groq_api_key else ""
-    ).strip()
-    provider_api_key = os.getenv("ANSWER_PROVIDER_API_KEY", "") or groq_api_key
-    provider_configured = bool(provider_url or provider_model or provider_api_key)
-    if provider_configured:
+    provider_name = env.get("ANSWER_PROVIDER_NAME", "Groq").strip()
+    provider_url = env.get("ANSWER_PROVIDER_URL", GROQ_BASE_URL).strip().rstrip("/")
+    provider_model = env.get("ANSWER_PROVIDER_MODEL", "").strip()
+    # Either process credential overrides file credentials, including the alias.
+    credentials = os.environ if any(
+        name in os.environ for name in ("ANSWER_PROVIDER_API_KEY", "GROQ_API_KEY")
+    ) else env
+    provider_api_key = (
+        credentials.get("ANSWER_PROVIDER_API_KEY", "").strip()
+        or credentials.get("GROQ_API_KEY", "").strip()
+    )
+    if provider_url:
         parsed_provider = urlparse(provider_url)
         if (
-            not provider_name
-            or parsed_provider.scheme != "https"
+            parsed_provider.scheme != "https"
             or not parsed_provider.hostname
             or parsed_provider.username
             or parsed_provider.password
             or parsed_provider.query
             or parsed_provider.fragment
-            or not provider_model
-            or not provider_api_key
         ):
-            raise ValueError("Configure ANSWER_PROVIDER_NAME, HTTPS ANSWER_PROVIDER_URL, ANSWER_PROVIDER_MODEL, and ANSWER_PROVIDER_API_KEY together")
+            raise ValueError("ANSWER_PROVIDER_URL must be an HTTPS base URL or chat/completions endpoint without credentials, query, or fragment")
 
-    sarvam_api_key = os.getenv("SARVAM_API_KEY", "").strip()
-
-    configured_database_path = os.getenv("PRIVACYPAL_DATABASE_PATH", "").strip()
+    configured_database_path = env.get("PRIVACYPAL_DATABASE_PATH", "").strip()
     database_path = Path(configured_database_path or _default_database_path()).expanduser()
     if not database_path.is_absolute():
         raise ValueError("PRIVACYPAL_DATABASE_PATH must be an absolute path")
 
     return Settings(
         host=str(address),
+        deployment_mode=deployment_mode,
+        proxy_token=proxy_token,
         port=port,
-        pdf_max_bytes=_positive_int("PDF_MAX_BYTES", 10 * 1024 * 1024),
-        pdf_max_pages=_positive_int("PDF_MAX_PAGES", 25),
-        pdf_max_chars=_positive_int("PDF_MAX_CHARS", 25_000),
-        pdf_timeout_seconds=_positive_float("PDF_TIMEOUT_SECONDS", 15.0),
+        pdf_max_bytes=_positive_int(env, "PDF_MAX_BYTES", 10 * 1024 * 1024),
+        pdf_max_pages=_positive_int(env, "PDF_MAX_PAGES", 25),
+        pdf_max_chars=_positive_int(env, "PDF_MAX_CHARS", 25_000),
+        pdf_timeout_seconds=_positive_float(env, "PDF_TIMEOUT_SECONDS", 15.0),
         ollama_base_url=ollama_base_url,
-        gemma_model=os.getenv("GEMMA_MODEL", "gemma4:e4b"),
+        gemma_model=env.get("GEMMA_MODEL", "gemma4:e4b"),
         frontend_origin=frontend_origin,
-        model_timeout_seconds=_positive_float("MODEL_TIMEOUT_SECONDS", 120.0),
-        answer_provider_name=provider_name or "OpenAI-compatible provider",
+        model_timeout_seconds=_positive_float(env, "MODEL_TIMEOUT_SECONDS", 120.0),
+        ollama_keep_alive_seconds=_positive_int(env, "OLLAMA_KEEP_ALIVE_SECONDS", 900),
+        answer_provider_name=provider_name or "Groq",
         answer_provider_url=provider_url,
         answer_provider_model=provider_model,
         answer_provider_api_key=provider_api_key,
-        answer_provider_timeout_seconds=_positive_float("ANSWER_PROVIDER_TIMEOUT_SECONDS", 30.0),
-        sarvam_api_key=sarvam_api_key,
-        sarvam_chat_model=os.getenv("SARVAM_CHAT_MODEL", "sarvam-105b").strip() or "sarvam-105b",
-        sarvam_translation_model=os.getenv("SARVAM_TRANSLATION_MODEL", "sarvam-translate:v1").strip() or "sarvam-translate:v1",
-        sarvam_tts_model=os.getenv("SARVAM_TTS_MODEL", "bulbul:v4-flash").strip() or "bulbul:v4-flash",
-        sarvam_timeout_seconds=_positive_float("SARVAM_TIMEOUT_SECONDS", 45.0),
+        answer_provider_timeout_seconds=_positive_float(env, "ANSWER_PROVIDER_TIMEOUT_SECONDS", 30.0),
+        sarvam_api_key=env.get("SARVAM_API_KEY", "").strip(),
+        sarvam_chat_model=env.get("SARVAM_CHAT_MODEL", "sarvam-105b").strip() or "sarvam-105b",
+        sarvam_translation_model=env.get("SARVAM_TRANSLATION_MODEL", "sarvam-translate:v1").strip() or "sarvam-translate:v1",
+        sarvam_tts_model=env.get("SARVAM_TTS_MODEL", "bulbul:v4-flash").strip() or "bulbul:v4-flash",
+        sarvam_timeout_seconds=_positive_float(env, "SARVAM_TIMEOUT_SECONDS", 45.0),
         database_path=str(database_path),
     )

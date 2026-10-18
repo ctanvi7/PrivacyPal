@@ -1,5 +1,10 @@
 # PrivacyPal Architecture
 
+> Authorized AWS demo mode (18 October 2026): a Lambda UI/proxy fronts a private
+> EC2 CPU backend and Gemma. Uploads are processed in AWS. The local MVP below
+> remains the default; hosted boundaries and operations are documented in
+> [deploy/aws/README.md](deploy/aws/README.md).
+
 ## 1. Purpose and decisions
 
 This document is the implementation source of truth for PrivacyPal's MVP architecture. It defines the application boundary, core workflow, component responsibilities, failure behavior, and security invariants. Follow it with the product requirements, SECURITY.md, DATABASE.md, and design.md.
@@ -209,7 +214,7 @@ Providers are configured only by server-side environment variables and exposed t
 - A translated request is a preview only. Applying it must use the normal draft-edit endpoint and rerun the privacy checks before answer approval.
 - Speech-to-text requires an explicit audio-send action and returns an editable transcript. It must never submit the transcript as a question automatically.
 - Text-to-speech and answer translation also require explicit per-action consent, because the answer text leaves the device again.
-- Bound audio to 10 MiB; Sarvam's synchronous transcription endpoint supports audio up to 30 seconds. Do not send documents, source text, or placeholder mappings to these endpoints.
+- Bound audio uploads to 10 MiB locally and 4 MiB through the AWS gateway; browser microphone recording stops after 30 seconds. Uploaded files remain subject to Sarvam's format/duration restrictions. Do not send documents, source text, or placeholder mappings to these endpoints.
 - Do not use Sarvam Vision in the current MVP. Document extraction and OCR remain local unless the team explicitly revises that product requirement and threat model.
 
 ### 5.9 Session manager, temporary files, and planned history
