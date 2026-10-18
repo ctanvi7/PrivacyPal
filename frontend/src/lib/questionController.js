@@ -11,7 +11,8 @@ function initialState() {
 
 function safeError(error) {
   if (error instanceof ApiError) {
-    return { code: error.code, message: error.message, retryable: error.retryable };
+    return { code: error.code, message: error.message, retryable: error.retryable,
+      ...(error.localChecks ? { localChecks: error.localChecks } : {}) };
   }
   return { code: 'processing_error', message: GENERIC_FAILURE, retryable: true };
 }

@@ -1,5 +1,12 @@
 # PrivacyPal Security Requirements
 
+> Authorized hosted demo exception (18 October 2026): uploads and Gemma processing
+> may run in AWS. The local-only assumptions below apply to default local mode.
+> Hosted mode requires HTTPS, browser authentication, exact Origin checks, a
+> private backend token, VPC restrictions, Secure ownership cookies, and explicit
+> AWS processing disclosure. The approved-request provider boundary is unchanged.
+> See [the hosted threat boundary and runbook](deploy/aws/README.md).
+
 **Status:** Security requirements for the desktop-first hackathon MVP
 **Product behavior:** `PrivacyPal_PRD.md`
 **Code conventions:** `upload/CODE_STYLE.md`

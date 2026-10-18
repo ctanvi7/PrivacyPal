@@ -1,5 +1,10 @@
 # PrivacyPal Architecture
 
+> Authorized AWS demo mode (18 October 2026): a Lambda UI/proxy fronts a private
+> EC2 CPU backend and Gemma. Uploads are processed in AWS. The local MVP below
+> remains the default; hosted boundaries and operations are documented in
+> [deploy/aws/README.md](deploy/aws/README.md).
+
 ## 1. Purpose and decisions
 
 This document is the implementation source of truth for PrivacyPal's MVP architecture. It defines the application boundary, core workflow, component responsibilities, failure behavior, and security invariants. Follow it with the product requirements, SECURITY.md, DATABASE.md, and design.md.
