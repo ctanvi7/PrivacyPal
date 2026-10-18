@@ -9,6 +9,8 @@ import { createConversationHistoryController, groupConversationsByLocalDate } fr
 import PrivacyReviewPanel from './components/PrivacyReviewPanel.jsx';
 
 const SAMPLE_REQUEST = 'Monthly take-home pay: ₹72,000\nPlanned rent: ₹28,000 per month\nQuestion: Is this rent affordable as a share of monthly income?';
+const SARVAM_LANGUAGES = [['en-IN', 'English'], ['hi-IN', 'Hindi'], ['bn-IN', 'Bengali'], ['ta-IN', 'Tamil'], ['te-IN', 'Telugu'], ['mr-IN', 'Marathi'], ['gu-IN', 'Gujarati'], ['kn-IN', 'Kannada'], ['ml-IN', 'Malayalam'], ['pa-IN', 'Punjabi'], ['od-IN', 'Odia'], ['as-IN', 'Assamese'], ['ur-IN', 'Urdu'], ['brx-IN', 'Bodo'], ['doi-IN', 'Dogri'], ['kok-IN', 'Konkani'], ['ks-IN', 'Kashmiri'], ['mai-IN', 'Maithili'], ['mni-IN', 'Manipuri'], ['ne-IN', 'Nepali'], ['sa-IN', 'Sanskrit'], ['sat-IN', 'Santali'], ['sd-IN', 'Sindhi']];
+const SARVAM_SPEECH_LANGUAGES = SARVAM_LANGUAGES.slice(0, 11);
 
 function Icon({ name, size = 20 }) {
   const props = { width: size, height: size, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', strokeWidth: 1.8, strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': true };
@@ -99,8 +101,29 @@ function App() {
   const [uploadState, setUploadState] = useState(uploadController.getState);
   const uploadStateRef = useRef(uploadState);
   uploadStateRef.current = uploadState;
+  const [providerOptions, setProviderOptions] = useState([]);
+  const [selectedProvider, setSelectedProvider] = useState('default');
+  const selectedProviderRef = useRef(selectedProvider);
+  selectedProviderRef.current = selectedProvider;
+  const [voiceFile, setVoiceFile] = useState(null);
+  const [voiceConsent, setVoiceConsent] = useState(false);
+  const [voiceBusy, setVoiceBusy] = useState(false);
+  const [voiceError, setVoiceError] = useState('');
+  const [voiceRecording, setVoiceRecording] = useState(false);
+  const [translationLanguage, setTranslationLanguage] = useState('hi-IN');
+  const [translationSourceLanguage, setTranslationSourceLanguage] = useState('en-IN');
+  const [speechLanguage, setSpeechLanguage] = useState('hi-IN');
+  const [answerConsent, setAnswerConsent] = useState(false);
+  const [speechConsent, setSpeechConsent] = useState(false);
+  const [answerTranslation, setAnswerTranslation] = useState('');
+  const [answerAudio, setAnswerAudio] = useState('');
+  const voiceInput = useRef(null);
+  const voiceRecorder = useRef(null);
+  const voiceStream = useRef(null);
+  const voiceChunks = useRef([]);
+  const voiceRecordingTimer = useRef(null);
   const [questionController] = useState(() => createQuestionController({ timeoutMs: 135_000,
-    submitQuestion: (text, document, { signal, session }) => privacyPalApi.submitQuestion(session.session_id, document.document_id, text, { signal }),
+    submitQuestion: (text, document, { signal, session }) => privacyPalApi.submitQuestion(session.session_id, document.document_id, text, { signal, providerId: selectedProviderRef.current }),
   }));
   const [questionState, setQuestionState] = useState(questionController.getState);
   const [reviewController] = useState(() => createPrivacyReviewController({
@@ -135,6 +158,24 @@ function App() {
   useEffect(() => reviewController.subscribe(setReviewState), [reviewController]);
   useEffect(() => historyController.subscribe(setHistoryState), [historyController]);
   useEffect(() => { void historyController.load(); }, [historyController]);
+  useEffect(() => {
+    let active = true;
+    void privacyPalApi.listProviders().then(({ items }) => {
+      if (!active) return;
+      setProviderOptions(items);
+      if (items.length && !items.some(item => item.id === selectedProviderRef.current)) setSelectedProvider(items[0].id);
+    }).catch(() => { if (active) setProviderOptions([]); });
+    return () => { active = false; };
+  }, []);
+  useEffect(() => { setVoiceConsent(false); setVoiceError(''); }, [voiceFile]);
+  useEffect(() => () => {
+    if (voiceRecordingTimer.current) clearTimeout(voiceRecordingTimer.current);
+    if (voiceRecorder.current?.state === 'recording') voiceRecorder.current.stop();
+    voiceStream.current?.getTracks().forEach(track => track.stop());
+  }, []);
+  useEffect(() => {
+    setAnswerConsent(false); setSpeechConsent(false); setAnswerTranslation(''); setAnswerAudio('');
+  }, [reviewState.result?.workflow_id, reviewState.result?.answer]);
   useEffect(() => {
     if (mobilePrivacyOpen) document.getElementById('privacy-panel')?.scrollIntoView({ behavior: 'auto', block: 'start' });
   }, [mobilePrivacyOpen]);
@@ -282,6 +323,122 @@ function App() {
     setNotice(submission.error?.message || 'A fresh local review is ready.');
   }
 
+  async function translateReviewedDraft(sourceLanguage, targetLanguage) {
+    const response = reviewController.getState().backendResponse;
+    const sessionId = uploadStateRef.current.session?.session_id;
+    if (!response || !sessionId) throw new Error('The active reviewed request is unavailable.');
+    return privacyPalApi.translateDraft(sessionId, response.workflow_id, response.version, sourceLanguage, targetLanguage);
+  }
+
+  async function useTranslatedDraft(text) {
+    reviewController.beginEditing();
+    reviewController.updateOutgoingText(text);
+    await reviewController.finishEditing();
+    setNotice('Translated request saved. Privacy checks ran again; review the new exact text before approval.');
+  }
+
+  async function startVoiceRecording() {
+    if (!navigator.mediaDevices?.getUserMedia || typeof window.MediaRecorder === 'undefined') {
+      setVoiceError('This browser does not support microphone recording. Choose an audio file instead.');
+      return;
+    }
+
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const mimeType = window.MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+        ? 'audio/webm;codecs=opus'
+        : window.MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : '';
+      const recorder = new window.MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+      voiceChunks.current = [];
+      voiceStream.current = stream;
+      voiceRecorder.current = recorder;
+      setVoiceFile(null);
+      setVoiceConsent(false);
+      setVoiceError('');
+      recorder.ondataavailable = event => {
+        if (event.data?.size) voiceChunks.current.push(event.data);
+      };
+      recorder.onerror = () => setVoiceError('Microphone recording failed. Please try again or choose an audio file.');
+      recorder.onstop = () => {
+        if (voiceRecordingTimer.current) clearTimeout(voiceRecordingTimer.current);
+        voiceRecordingTimer.current = null;
+        const audioType = recorder.mimeType || 'audio/webm';
+        const audioBlob = new Blob(voiceChunks.current, { type: audioType });
+        voiceStream.current?.getTracks().forEach(track => track.stop());
+        voiceStream.current = null;
+        voiceRecorder.current = null;
+        setVoiceRecording(false);
+        if (!audioBlob.size) {
+          setVoiceError('No audio was recorded. Please try again.');
+        } else if (audioBlob.size > 10 * 1024 * 1024) {
+          setVoiceError('The recording exceeds the 10 MiB limit. Please record a shorter message.');
+        } else {
+          setVoiceFile(new File([audioBlob], 'privacypal-dictation.webm', { type: audioType }));
+        }
+      };
+      recorder.start();
+      setVoiceRecording(true);
+      voiceRecordingTimer.current = setTimeout(() => {
+        if (recorder.state === 'recording') {
+          setVoiceError('Recording stopped at the 30-second limit. Review it, then choose whether to send it for transcription.');
+          recorder.stop();
+        }
+      }, 30_000);
+    } catch (error) {
+      stream?.getTracks().forEach(track => track.stop());
+      setVoiceRecording(false);
+      setVoiceError(error?.name === 'NotAllowedError'
+        ? 'Microphone access was denied. Allow microphone access in your browser, or choose an audio file instead.'
+        : 'Could not start microphone recording. Check that a microphone is connected, or choose an audio file instead.');
+    }
+  }
+
+  function stopVoiceRecording() {
+    if (voiceRecordingTimer.current) clearTimeout(voiceRecordingTimer.current);
+    voiceRecordingTimer.current = null;
+    if (voiceRecorder.current?.state === 'recording') voiceRecorder.current.stop();
+  }
+
+  async function transcribeSelectedAudio() {
+    const sessionId = uploadState.session?.session_id;
+    if (!sessionId || !voiceFile || !voiceConsent) return;
+    setVoiceBusy(true); setVoiceError(''); setVoiceConsent(false);
+    try {
+      const result = await privacyPalApi.transcribeAudio(sessionId, voiceFile);
+      setQuestion(result.transcript);
+      questionController.setQuestion(result.transcript);
+      setVoiceFile(null);
+      if (voiceInput.current) voiceInput.current.value = '';
+      setNotice('Transcript ready. Review or edit the text in the question box before submitting it.');
+    } catch (error) { setVoiceError(error?.message || 'Speech transcription failed.'); }
+    finally { setVoiceBusy(false); }
+  }
+
+  async function translateDisplayedAnswer() {
+    const sessionId = uploadState.session?.session_id;
+    const answer = reviewState.result?.answer;
+    if (!sessionId || !answer || !answerConsent) return;
+    setVoiceBusy(true); setVoiceError(''); setAnswerTranslation(''); setAnswerConsent(false);
+    try {
+      const result = await privacyPalApi.translateAnswer(sessionId, answer, translationSourceLanguage, translationLanguage);
+      setAnswerTranslation(result.translated_text);
+    } catch (error) { setVoiceError(error?.message || 'Answer translation failed.'); }
+    finally { setVoiceBusy(false); }
+  }
+
+  async function speakDisplayedAnswer() {
+    const sessionId = uploadState.session?.session_id;
+    const answer = reviewState.result?.answer;
+    if (!sessionId || !answer || !speechConsent) return;
+    setVoiceBusy(true); setVoiceError(''); setAnswerAudio(''); setSpeechConsent(false);
+    try {
+      const result = await privacyPalApi.synthesizeSpeech(sessionId, answer, speechLanguage);
+      setAnswerAudio(`data:${result.content_type};base64,${result.audio_base64}`);
+    } catch (error) { setVoiceError(error?.message || 'Speech generation failed.'); }
+    finally { setVoiceBusy(false); }
+  }
+
   const hasPreview = mode === 'preview';
   const historyGroups = groupConversationsByLocalDate(historyState.items);
   const conversationGroups = [
@@ -334,8 +491,8 @@ function App() {
           <div className="user-row"><div className="user-message"><p>{uploadState.status === 'uploaded' ? 'Document uploaded' : uploadState.status === 'uploading' ? 'Uploading document' : 'Document selected'}</p><FileChip file={file} uploaded={uploadState.status === 'uploaded'} onRemove={removeDocument}/></div></div>
           {reviewState.status === 'sent' && reviewState.result?.history_saved ? <SavedMessages messages={historyState.detail?.messages || []} answerResult={reviewState.result}/> : <>
             {questionState.question && <div className="user-row"><div className="user-message"><p>{questionState.question}</p></div></div>}
-            {questionState.result ? <PrivacyReviewPanel state={reviewState} controller={reviewController} onRestart={restartReview}/> : <div className="pending-card glass-panel"><span className="pending-icon"><Icon name="lock" size={22}/></span><div><h2>{uploadState.status === 'uploading' ? 'Uploading to local service' : uploadState.status === 'upload-error' || uploadState.status === 'cancelled' ? 'Upload needs attention' : 'Ready for your question'}</h2><p>{uploadState.status === 'uploading' ? 'Creating a session and processing the selected file. Please wait.' : uploadState.status === 'uploaded' ? 'The local service confirmed this document. Ask a question to run local privacy analysis; this step does not send anything to an answer provider.' : uploadState.error?.message || 'The selected file remains local until the service confirms a successful upload.'}</p>{uploadState.status === 'uploading' && <button className="edit-button" type="button" onClick={() => uploadController.cancel()}>Cancel upload</button>}{uploadState.error?.retryable && <button className="edit-button" type="button" onClick={() => uploadController.retry()}>Retry upload</button>}</div></div>}
-            {reviewState.result?.answer && <div className="assistant-row"><ShieldMark className="assistant-avatar"/><div className="assistant-message"><p>{reviewState.result.answer}</p>{reviewState.result.pages_used?.length > 0 && <p className="answer-citation">Source pages: {reviewState.result.pages_used.join(', ')}</p>}<time>Answer returned by the backend</time></div></div>}
+            {questionState.result ? <PrivacyReviewPanel state={reviewState} controller={reviewController} onRestart={restartReview} onTranslate={translateReviewedDraft} onUseTranslation={useTranslatedDraft} sarvamAvailable={providerOptions.some(item => item.id === 'sarvam')}/> : <div className="pending-card glass-panel"><span className="pending-icon"><Icon name="lock" size={22}/></span><div><h2>{uploadState.status === 'uploading' ? 'Uploading to local service' : uploadState.status === 'upload-error' || uploadState.status === 'cancelled' ? 'Upload needs attention' : 'Ready for your question'}</h2><p>{uploadState.status === 'uploading' ? 'Creating a session and processing the selected file. Please wait.' : uploadState.status === 'uploaded' ? 'The local service confirmed this document. Ask a question to run local privacy analysis; this step does not send anything to an answer provider.' : uploadState.error?.message || 'The selected file remains local until the service confirms a successful upload.'}</p>{uploadState.status === 'uploading' && <button className="edit-button" type="button" onClick={() => uploadController.cancel()}>Cancel upload</button>}{uploadState.error?.retryable && <button className="edit-button" type="button" onClick={() => uploadController.retry()}>Retry upload</button>}</div></div>}
+            {reviewState.result?.answer && <div className="assistant-row"><ShieldMark className="assistant-avatar"/><div className="assistant-message"><p>{reviewState.result.answer}</p>{reviewState.result.pages_used?.length > 0 && <p className="answer-citation">Source pages: {reviewState.result.pages_used.join(', ')}</p>}<time>Answer returned by the backend</time>{providerOptions.some(item => item.id === 'sarvam') && <section className="sarvam-answer-tools" aria-label="Optional Sarvam translation and speech"><label>Source language <select value={translationSourceLanguage} onChange={event => setTranslationSourceLanguage(event.target.value)}>{SARVAM_LANGUAGES.map(([code, name]) => <option key={`source-${code}`} value={code}>{name}</option>)}</select></label><label>Translation language <select value={translationLanguage} onChange={event => setTranslationLanguage(event.target.value)}>{SARVAM_LANGUAGES.map(([code, name]) => <option key={`target-${code}`} value={code}>{name}</option>)}</select></label><label className="sarvam-consent"><input type="checkbox" checked={answerConsent} onChange={event => setAnswerConsent(event.target.checked)}/> Send this displayed answer to Sarvam for translation.</label><button className="edit-button" type="button" disabled={!answerConsent || voiceBusy} onClick={() => void translateDisplayedAnswer()}>{voiceBusy ? 'Working…' : 'Translate answer'}</button>{answerTranslation && <p className="translated-answer">{answerTranslation}</p>}<label>Speech language <select value={speechLanguage} onChange={event => setSpeechLanguage(event.target.value)}>{SARVAM_SPEECH_LANGUAGES.map(([code, name]) => <option key={`speech-${code}`} value={code}>{name}</option>)}</select></label><label className="sarvam-consent"><input type="checkbox" checked={speechConsent} onChange={event => setSpeechConsent(event.target.checked)}/> Send this displayed answer text to Sarvam to create audio.</label><button className="edit-button" type="button" disabled={!speechConsent || voiceBusy} onClick={() => void speakDisplayedAnswer()}>Read answer aloud</button>{answerAudio && <audio controls src={answerAudio}>Audio playback is not supported by this browser.</audio>}{voiceError && <p role="alert">{voiceError}</p>}</section>}</div></div>}
           </>}
         </> : <EmptyConversation onChoose={() => fileInput.current?.click()}/>}
 
@@ -344,7 +501,9 @@ function App() {
         {notice && <p className="notice" role="status">{notice}</p>}
       </div>
 
-      <form className="composer glass-panel" onSubmit={submitQuestion}><input ref={fileInput} className="visually-hidden" type="file" accept="application/pdf,image/png,image/jpeg,image/webp" aria-label="Choose a PDF or image document" onChange={event => selectDocument(event.target.files?.[0])}/><button className="attach-button" type="button" aria-label="Attach a document" onClick={() => fileInput.current?.click()} disabled={uploadState.status === 'uploading' || questionState.status === 'processing'}><Icon name="attach" size={20}/></button><label className="visually-hidden" htmlFor="question">Ask a question about your document</label><textarea id="question" value={question} onChange={event => { setQuestion(event.target.value); questionController.setQuestion(event.target.value); if (notice) setNotice(''); }} placeholder={hasPreview ? 'Ask a follow-up about this sample?' : file ? 'Ask a question about this document?' : 'Choose a document to start a private chat…'} rows="1" disabled={questionState.status === 'processing' || uploadState.status === 'uploading'}/><button className="send-button" type="submit" aria-label="Submit question" disabled={questionState.status === 'processing' || uploadState.status !== 'uploaded' || !question.trim()}><Icon name="send" size={19}/></button></form>
+        {providerOptions.length > 0 && <div className="provider-choice"><label htmlFor="answer-provider">Answer provider</label><select id="answer-provider" value={selectedProvider} disabled={questionState.status === 'processing' || Boolean(questionState.result)} onChange={event => setSelectedProvider(event.target.value)}>{providerOptions.map(provider => <option key={provider.id} value={provider.id}>{provider.name}</option>)}</select><span>The selected provider receives only the exact reviewed request after approval.</span></div>}
+        <form className="composer glass-panel" onSubmit={submitQuestion}><input ref={fileInput} className="visually-hidden" type="file" accept="application/pdf,image/png,image/jpeg,image/webp" aria-label="Choose a PDF or image document" onChange={event => selectDocument(event.target.files?.[0])}/><button className="attach-button" type="button" aria-label="Attach a document" onClick={() => fileInput.current?.click()} disabled={uploadState.status === 'uploading' || questionState.status === 'processing'}><Icon name="attach" size={20}/></button><label className="visually-hidden" htmlFor="question">Ask a question about your document</label><textarea id="question" value={question} onChange={event => { setQuestion(event.target.value); questionController.setQuestion(event.target.value); if (notice) setNotice(''); }} placeholder={hasPreview ? 'Ask a follow-up about this sample?' : file ? 'Ask a question about this document?' : 'Choose a document to start a private chat…'} rows="1" disabled={questionState.status === 'processing' || uploadState.status === 'uploading'}/><button className="send-button" type="submit" aria-label="Submit question" disabled={questionState.status === 'processing' || uploadState.status !== 'uploaded' || !question.trim()}><Icon name="send" size={19}/></button></form>
+        {providerOptions.some(item => item.id === 'sarvam') && uploadState.session && <section className="voice-input-tools" aria-label="Optional voice dictation"><input ref={voiceInput} className="visually-hidden" type="file" accept="audio/wav,audio/x-wav,audio/mpeg,audio/mp3,audio/aac,audio/flac,audio/ogg,audio/opus,audio/webm,audio/aiff,audio/mp4,video/mp4,.wav,.mp3,.aac,.flac,.ogg,.opus,.webm,.aiff,.m4a,.mp4,.amr,.wma" onChange={event => { setVoiceFile(event.target.files?.[0] || null); setVoiceError(''); }} aria-label="Choose an audio recording"/><p>Dictate a question or choose a recording. Microphone audio stays in this browser until you explicitly consent and select Transcribe. Recordings are limited to 30 seconds and 10 MiB. The transcript appears in the question box for review; it is not submitted automatically.</p>{voiceRecording ? <button className="edit-button" type="button" onClick={stopVoiceRecording} disabled={voiceBusy}>Stop dictation</button> : <button className="edit-button" type="button" onClick={() => void startVoiceRecording()} disabled={voiceBusy}>Start dictation</button>}{voiceRecording && <p role="status">Recording… Select Stop dictation when you are finished.</p>}<button className="edit-button" type="button" onClick={() => voiceInput.current?.click()} disabled={voiceBusy || voiceRecording}>Choose audio file instead</button>{voiceFile && <span>Ready to transcribe: {voiceFile.name}</span>}<label className="sarvam-consent"><input type="checkbox" checked={voiceConsent} onChange={event => setVoiceConsent(event.target.checked)}/> I consent to send this recording to Sarvam for transcription.</label><button className="edit-button" type="button" disabled={!voiceFile || !voiceConsent || voiceBusy || voiceRecording} onClick={() => void transcribeSelectedAudio()}>{voiceBusy ? 'Transcribing…' : 'Transcribe audio'}</button>{voiceError && <p role="alert">{voiceError}</p>}</section>}
     </section>
 
     <aside id="privacy-panel" className={`privacy-panel glass-panel ${mobilePrivacyOpen ? 'mobile-open' : ''}`} aria-label="Privacy review status">

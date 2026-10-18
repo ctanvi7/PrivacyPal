@@ -259,10 +259,21 @@ The persistent schema is documented in DATABASE.md. SQLite history is not encryp
 
 The current FastAPI implementation uses these route names and fields (the proposal above remains useful as the behavioral contract):
 
-- `POST /api/v1/sessions/{session_id}/questions` runs Gemma's ordered local tools and returns `workflow_id`, `version`, the sanitized `draft`, safe `findings`, `residual_review`, and provider name/endpoint/configuration status. It does not contact the answer provider.
+- `POST /api/v1/sessions/{session_id}/questions` accepts optional `provider_id` (`default` or `sarvam`), binds that configured provider to the workflow, runs Gemma's ordered local tools, and returns `workflow_id`, `version`, the sanitized `draft`, safe `findings`, `residual_review`, and the selected provider name/endpoint/configuration status. It does not contact an answer provider.
 - `PATCH /api/v1/sessions/{session_id}/workflows/{workflow_id}/draft` accepts `{ "version": 1, "draft": "..." }`, increments the version, clears acknowledgement, and reruns local checks, including Gemma's contextual review.
 - `POST /api/v1/sessions/{session_id}/workflows/{workflow_id}/acknowledge` accepts the current version and records the user's acknowledgement of remaining non-blocking warnings.
 - `POST /api/v1/sessions/{session_id}/workflows/{workflow_id}/approve` accepts the current version and optional `restore_placeholders`; the backend consumes approval before making one provider call and returns the answer in that response.
 - `POST /api/v1/sessions/{session_id}/workflows/{workflow_id}/cancel` discards an unsent review.
 
-The answer provider is configured through backend environment variables (`ANSWER_PROVIDER_NAME`, `ANSWER_PROVIDER_URL`, `ANSWER_PROVIDER_MODEL`, `ANSWER_PROVIDER_API_KEY`). The URL must use HTTPS. Its OpenAI-compatible adapter receives one user message containing exactly the current approved draft. It does not receive source text, other chat history, or the placeholder mapping. Provider errors are not automatically retried; an ambiguous failure is reported as delivery-unknown. After a provider answer returns, a detected high-risk credential causes the answer to be withheld and not persisted. A successful answer is returned even if its local history write fails or is refused by the high-risk-content guard; the response reports `history_saved: false`.
+The default answer provider is configured through backend environment variables (`ANSWER_PROVIDER_NAME`, `ANSWER_PROVIDER_URL`, `ANSWER_PROVIDER_MODEL`, `ANSWER_PROVIDER_API_KEY`) or `GROQ_API_KEY`. Sarvam is enabled by the backend-only `SARVAM_API_KEY`. `GET /api/v1/providers` returns configured choices without credentials. The provider URL is fixed for Sarvam and HTTPS is required. Adapters receive one user message containing exactly the current approved draft. They do not receive source text, other chat history, or the placeholder mapping. Provider errors are not automatically retried or sent to another provider; an ambiguous answer-provider failure is reported as delivery-unknown.
+
+### Optional Sarvam language routes
+
+These routes are unavailable unless `SARVAM_API_KEY` is configured. Each outbound translation or speech action requires a separate explicit consent field and has no provider fallback.
+
+- `POST /api/v1/sessions/{session_id}/workflows/{workflow_id}/translate-draft` takes `{ "version": 1, "source_language": "en-IN", "target_language": "hi-IN", "consent": true }`. The server reads the current reviewed draft; the client cannot supply replacement source text. It returns a translation preview. Mask placeholders must be preserved exactly. Applying the preview uses the normal draft-edit route and reruns all privacy checks before approval.
+- `POST /api/v1/sessions/{session_id}/translate-answer` takes the exact displayed answer, its source/target languages, and consent. It accepts only the answer digest recorded for the last successful answer in that session. Text containing a blocked high-risk value is rejected.
+- `POST /api/v1/sessions/{session_id}/speech/transcribe` accepts `multipart/form-data` with `file` and `consent=true`. Audio is limited to 10 MiB; Sarvam's synchronous endpoint handles recordings shorter than 30 seconds. The returned transcript must be reviewed/edited before a normal question submission; it is never submitted automatically.
+- `POST /api/v1/sessions/{session_id}/speech/synthesize` takes the exact last returned answer, a supported speech language, and `consent=true`. The server checks the answer digest and returns base64 WAV audio.
+
+The translation and speech endpoints never receive a source document, full extracted text, or placeholder mapping. Sarvam Vision is not used; OCR and document processing stay local.

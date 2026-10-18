@@ -27,6 +27,11 @@ class Settings:
     answer_provider_model: str = ""
     answer_provider_api_key: str = field(default="", repr=False)
     answer_provider_timeout_seconds: float = 30.0
+    sarvam_api_key: str = field(default="", repr=False)
+    sarvam_chat_model: str = "sarvam-105b"
+    sarvam_translation_model: str = "sarvam-translate:v1"
+    sarvam_tts_model: str = "bulbul:v4-flash"
+    sarvam_timeout_seconds: float = 45.0
     database_path: str = ""
 
 
@@ -119,6 +124,8 @@ def get_settings() -> Settings:
         ):
             raise ValueError("Configure ANSWER_PROVIDER_NAME, HTTPS ANSWER_PROVIDER_URL, ANSWER_PROVIDER_MODEL, and ANSWER_PROVIDER_API_KEY together")
 
+    sarvam_api_key = os.getenv("SARVAM_API_KEY", "").strip()
+
     configured_database_path = os.getenv("PRIVACYPAL_DATABASE_PATH", "").strip()
     database_path = Path(configured_database_path or _default_database_path()).expanduser()
     if not database_path.is_absolute():
@@ -140,5 +147,10 @@ def get_settings() -> Settings:
         answer_provider_model=provider_model,
         answer_provider_api_key=provider_api_key,
         answer_provider_timeout_seconds=_positive_float("ANSWER_PROVIDER_TIMEOUT_SECONDS", 30.0),
+        sarvam_api_key=sarvam_api_key,
+        sarvam_chat_model=os.getenv("SARVAM_CHAT_MODEL", "sarvam-105b").strip() or "sarvam-105b",
+        sarvam_translation_model=os.getenv("SARVAM_TRANSLATION_MODEL", "sarvam-translate:v1").strip() or "sarvam-translate:v1",
+        sarvam_tts_model=os.getenv("SARVAM_TTS_MODEL", "bulbul:v4-flash").strip() or "bulbul:v4-flash",
+        sarvam_timeout_seconds=_positive_float("SARVAM_TIMEOUT_SECONDS", 45.0),
         database_path=str(database_path),
     )

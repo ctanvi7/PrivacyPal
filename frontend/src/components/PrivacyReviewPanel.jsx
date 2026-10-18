@@ -1,3 +1,5 @@
+import { useEffect, useState } from 'react';
+
 const STATUS_LABELS = {
   'review-ready': 'Review the backend-provided text and recommendations.',
   'review-blocked': 'The backend review is incomplete or blocked. Approval is unavailable.',
@@ -12,7 +14,23 @@ const STATUS_LABELS = {
   'review-error': 'This workflow could not be updated. Start a new review before approval.',
 };
 
-export default function PrivacyReviewPanel({ state, controller, onRestart }) {
+const LANGUAGES = [
+  ['hi-IN', 'Hindi'], ['bn-IN', 'Bengali'], ['ta-IN', 'Tamil'], ['te-IN', 'Telugu'],
+  ['mr-IN', 'Marathi'], ['gu-IN', 'Gujarati'], ['kn-IN', 'Kannada'], ['ml-IN', 'Malayalam'],
+  ['pa-IN', 'Punjabi'], ['od-IN', 'Odia'], ['as-IN', 'Assamese'], ['ur-IN', 'Urdu'], ['en-IN', 'English'],
+  ['brx-IN', 'Bodo'], ['doi-IN', 'Dogri'], ['kok-IN', 'Konkani'], ['ks-IN', 'Kashmiri'],
+  ['mai-IN', 'Maithili'], ['mni-IN', 'Manipuri'], ['ne-IN', 'Nepali'], ['sa-IN', 'Sanskrit'],
+  ['sat-IN', 'Santali'], ['sd-IN', 'Sindhi'],
+];
+
+export default function PrivacyReviewPanel({ state, controller, onRestart, onTranslate, onUseTranslation, sarvamAvailable = false }) {
+  const [targetLanguage, setTargetLanguage] = useState('hi-IN');
+  const [sourceLanguage, setSourceLanguage] = useState('en-IN');
+  const [translationConsent, setTranslationConsent] = useState(false);
+  const [translation, setTranslation] = useState(null);
+  const [translationBusy, setTranslationBusy] = useState(false);
+  const [translationError, setTranslationError] = useState('');
+  useEffect(() => { setTranslation(null); setTranslationConsent(false); setTranslationError(''); }, [state?.backendResponse?.version]);
   if (!state?.review || !state.backendResponse) return null;
   const response = state.backendResponse;
   const editing = state.status === 'editing';
@@ -21,6 +39,14 @@ export default function PrivacyReviewPanel({ state, controller, onRestart }) {
   const canContinue = state.status === 'review-ready';
   const canAcknowledge = state.status === 'awaiting-acknowledgement';
   const awaitingApproval = state.status === 'awaiting-approval';
+  const sarvamSelected = sarvamAvailable;
+
+  async function translateCurrentDraft() {
+    setTranslationBusy(true); setTranslationError(''); setTranslation(null);
+    try { setTranslation(await onTranslate(sourceLanguage, targetLanguage)); }
+    catch (error) { setTranslationError(error?.message || 'Translation failed. No fallback provider was used.'); }
+    finally { setTranslationBusy(false); }
+  }
 
   return <section className="review-card glass-panel" aria-labelledby="backend-review-title" aria-busy={busy}>
     <div className="review-top"><span className="review-lock" aria-hidden="true">✓</span><div className="review-title"><h2 id="backend-review-title">Local privacy review</h2><p>{STATUS_LABELS[state.status] || 'Review the backend-provided request.'}</p></div></div>
@@ -41,7 +67,18 @@ export default function PrivacyReviewPanel({ state, controller, onRestart }) {
       <textarea id="backend-final-request" className="request-preview" value={state.exactOutgoingText} readOnly={!editing} onChange={event => controller.updateOutgoingText(event.target.value)} />
     </section>
 
-    <p className="review-footnote">Workflow {response.workflow_id} · version {response.version} · pages used: {response.pages_used.length ? response.pages_used.join(', ') : 'none reported'} · provider: {response.provider.name || 'not supplied'} ({response.provider.configured ? 'configured' : 'not configured'})</p>
+    {sarvamSelected && <section className="sarvam-translation" aria-labelledby="sarvam-request-translation-title">
+      <h3 id="sarvam-request-translation-title">Translate this reviewed request with Sarvam</h3>
+      <p>Sarvam receives the exact sanitized request shown above. Your document and placeholder mappings stay local. This does not approve or send an answer request.</p>
+      <label>Source language <select value={sourceLanguage} onChange={event => setSourceLanguage(event.target.value)}>{LANGUAGES.map(([code, name]) => <option key={code} value={code}>{name}</option>)}</select></label>
+      <label>Translation language <select value={targetLanguage} onChange={event => setTargetLanguage(event.target.value)}>{LANGUAGES.map(([code, name]) => <option key={code} value={code}>{name}</option>)}</select></label>
+      <label className="sarvam-consent"><input type="checkbox" checked={translationConsent} onChange={event => setTranslationConsent(event.target.checked)}/> I understand this reviewed text will be sent to Sarvam for translation.</label>
+      <button type="button" className="edit-button" disabled={!translationConsent || translationBusy || busy || ['sending', 'sent'].includes(state.status)} onClick={() => void translateCurrentDraft()}>{translationBusy ? 'Translating…' : 'Translate reviewed request'}</button>
+      {translationError && <p role="alert">{translationError}</p>}
+      {translation?.translated_text && <><label htmlFor="translated-request-preview">Translation preview — review it before use</label><textarea id="translated-request-preview" className="request-preview" readOnly value={translation.translated_text}/><button type="button" className="edit-button" onClick={() => { onUseTranslation(translation.translated_text); setTranslation(null); setTranslationConsent(false); }}>Use translation and rerun privacy checks</button></>}
+    </section>}
+
+    <p className="review-footnote">Workflow {response.workflow_id} · version {response.version} · pages used: {response.pages_used.length ? response.pages_used.join(', ') : 'none reported'} · provider: {response.provider.name || 'not supplied'} ({response.provider.configured ? 'configured' : 'not configured'}){response.provider.endpoint ? ` · ${response.provider.endpoint}` : ''}</p>
     {state.error && <p className="notice" role="alert">{state.error.message}</p>}
     <div className="review-actions">
       {canEdit && !editing && <button className="edit-button" type="button" disabled={busy} onClick={() => controller.beginEditing()}>Edit request</button>}

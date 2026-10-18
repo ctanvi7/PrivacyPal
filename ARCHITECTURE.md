@@ -20,7 +20,7 @@ PrivacyPal is a local-first AI workspace. In the hackathon MVP, the browser UI, 
 | Sensitive-data checks | Deterministic detectors plus Gemma contextual analysis |
 | Active session/workflow storage | In-memory, process-local state; active state is not restored after restart |
 | Conversation history | Local SQLite history containing successful user questions and returned answers for up to 30 days |
-| External answer AI | Server-side provider adapter; provider/model chosen through configuration |
+| External answer and language AI | Backend allowlist of configured providers; each workflow binds to the selected provider/model |
 | Deployment | Local demo on one machine; do not describe a hosted backend as on-device/local |
 
 Do not add a cloud OCR service, cloud file storage, telemetry, or account system. Conversation persistence stores only successful question/answer pairs in local history; active workflow state remains ephemeral. See DATABASE.md for storage scope and retention.
@@ -42,9 +42,10 @@ The original file is never modified. PrivacyPal reduces disclosure risk but does
 7. A residual privacy check runs on the exact sanitized draft.
 8. The UI shows findings, edits, the exact outbound request, and the selected external provider.
 9. The user edits, approves, or cancels. Any edit invalidates the previous review and approval and triggers revalidation.
-10. On explicit approval, the backend validates the current draft and sends only that payload to the configured answer provider.
-11. The answer appears in the same chat. Placeholder restoration, if enabled, occurs locally and only for exact known placeholders.
-12. Clearing the active session removes temporary content, mappings, files, and approval state. Saved history remains unless the user explicitly deletes it.
+10. On explicit approval, the backend validates the current draft and sends only that payload to the selected answer provider.
+11. Optional Sarvam translation and speech actions require separate, visible consent. Request translation uses the server-held reviewed draft; the translated preview must be applied and privacy-checked again before answer approval. Speech transcripts are reviewed and edited before submission.
+12. The answer appears in the same chat. Placeholder restoration, if enabled, occurs locally and only for exact known placeholders.
+13. Clearing the active session removes temporary content, mappings, files, and approval state. Saved history remains unless the user explicitly deletes it.
 
 ## 3. Trust boundaries
 
@@ -54,6 +55,7 @@ The original file is never modified. PrivacyPal reduces disclosure risk but does
 | Document to Gemma/OCR | Extracted text, metadata, embedded instructions | Treat as untrusted data; document instructions cannot change policy or authorize sending |
 | Gemma to tool registry | Tool names and arguments | Native tool calls only; validate allowlist, JSON schema, size, count, and workflow state |
 | Local backend to external answer provider | Approved sanitized request | Backend-only adapter; exact current request; explicit approval; no original file or mapping |
+| Local backend to Sarvam language services | Reviewed request for translation, displayed answer for translation/TTS, or selected audio for STT | Backend-only Sarvam adapter; separate action-level consent; never source file, full extracted text, or placeholder mapping |
 | Provider response to browser | Generated answer and references | Treat as untrusted output; render safely; validate citations and never execute returned markup |
 
 Gemma is a planner and analyst, not an authorization boundary. The backend owns tool execution, privacy enforcement, session ownership, and the approval gate.
@@ -198,7 +200,17 @@ It must:
 - Avoid blind retries after an ambiguous timeout; report that delivery may have occurred.
 - Return safe status and errors without logging request or response bodies.
 
-The chosen provider is a runtime configuration decision. The provider name and endpoint must be visible to the user before approval. No provider is called during local analysis.
+Providers are configured only by server-side environment variables and exposed to the UI through a safe list without credentials. The workflow binds to the user's selected configured provider before local analysis; changing the choice requires a new workflow. The provider name and endpoint must be visible before approval. No answer provider is called during local analysis. Sarvam translation and speech are separate actions with independent consent and must fail without a fallback.
+
+### 5.8.1 Sarvam translation and speech adapter
+
+- Keep the Sarvam subscription key on the backend and call only the fixed `api.sarvam.ai` host over HTTPS.
+- Translate only the exact current reviewed draft or answer text the user explicitly selected for translation. Preserve every existing masked placeholder exactly; fail closed if the translation changes, drops, or duplicates a marker.
+- A translated request is a preview only. Applying it must use the normal draft-edit endpoint and rerun the privacy checks before answer approval.
+- Speech-to-text requires an explicit audio-send action and returns an editable transcript. It must never submit the transcript as a question automatically.
+- Text-to-speech and answer translation also require explicit per-action consent, because the answer text leaves the device again.
+- Bound audio to 10 MiB; Sarvam's synchronous transcription endpoint supports audio up to 30 seconds. Do not send documents, source text, or placeholder mappings to these endpoints.
+- Do not use Sarvam Vision in the current MVP. Document extraction and OCR remain local unless the team explicitly revises that product requirement and threat model.
 
 ### 5.9 Session manager, temporary files, and planned history
 
